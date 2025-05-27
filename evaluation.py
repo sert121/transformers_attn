@@ -1,261 +1,188 @@
 ## evaluation.py
 
 import os
-import glob
-import re
-from typing import Any, Dict, List, NamedTuple, Optional
+from typing import List, Dict
 
 import torch
 import torch.nn.functional as F
-from torch import Tensor
-from torch.utils.data import DataLoader
+from tokenizers import Tokenizer
+from tqdm import tqdm
 import sacrebleu
-from sentencepiece import SentencePieceProcessor
 
-from config import Config
-from model import TransformerModel  # Assuming model.py is in the same package
+from utils import Config
 
 
-class BeamEntry(NamedTuple):
-    """Represents a hypothesis in beam search."""
-    seq: List[int]
-    logprob: float
-
-
-class Evaluation:
+class Evaluator:
     """
-    Evaluation engine for Transformer models. Performs checkpoint averaging,
-    beam-search decoding, and computes corpus BLEU and token-level loss.
+    Evaluator for the Transformer model.
+    Performs beam-search decoding on the test set and computes corpus BLEU.
     """
 
     def __init__(
         self,
-        model: TransformerModel,
-        config: Config,
-        test_loader: DataLoader,
+        model: torch.nn.Module,
+        test_loader: torch.utils.data.DataLoader,
+        config: Config
     ) -> None:
         """
-        Initialize evaluation with a trained model, configuration, and test DataLoader.
+        Initialize the evaluator.
 
         Args:
-            model: TransformerModel instance.
-            config: Config object with inference and logging settings.
-            test_loader: DataLoader yielding batches for evaluation.
+            model: Trained TransformerModel (in eval mode).
+            test_loader: DataLoader yielding batches of {'src': Tensor, 'tgt': Tensor}.
+            config: Configuration object.
         """
         self.model = model
-        self.config = config
         self.test_loader = test_loader
-        # Device setup
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.model.to(self.device)
-        # Load and average checkpoints
-        self._average_checkpoints()
-        # Prepare tokenizer
-        self._load_tokenizer()
-        # Loss function: sum over non-pad tokens
-        self.loss_fn = torch.nn.CrossEntropyLoss(
-            ignore_index=self.pad_id, reduction="sum"
-        )
-        # Inference parameters
-        inf = config["inference"]
-        self.beam_size: int = int(inf["beam_size"])
-        self.length_penalty: float = float(inf["length_penalty"])
-        self.max_len_offset: int = int(inf["max_len_offset"])
+        self.config = config
 
-    def _average_checkpoints(self) -> None:
-        """
-        Load the last N checkpoints and average their model parameters.
-        """
-        # Determine checkpoint directory
-        # Default to 'checkpoints' if not specified
-        ckpt_dir = self.config.get("logging.checkpoint_dir", "checkpoints")
-        if not os.path.isdir(ckpt_dir):
-            raise FileNotFoundError(f"Checkpoint directory not found: {ckpt_dir}")
-        # Find all checkpoint files (*.pt or *.pth)
-        patterns = ["*.pt", "*.pth"]
-        ckpt_paths: List[str] = []
-        for pat in patterns:
-            ckpt_paths.extend(glob.glob(os.path.join(ckpt_dir, pat)))
-        if not ckpt_paths:
-            raise FileNotFoundError(f"No checkpoint files found in {ckpt_dir}")
-        # Sort by modification time
-        ckpt_paths.sort(key=os.path.getmtime)
-        # Select last N
-        n_avg = int(self.config["inference.avg_checkpoints"])
-        selected = ckpt_paths[-n_avg:]
-        # Load and sum parameters
-        avg_state: Dict[str, Tensor] = {}
-        for idx, path in enumerate(selected):
-            chk = torch.load(path, map_location="cpu")
-            # Extract model state dict
-            state = (
-                chk["model_state_dict"]
-                if isinstance(chk, dict) and "model_state_dict" in chk
-                else chk
-            )
-            # On first checkpoint, initialize
-            if idx == 0:
-                for k, v in state.items():
-                    avg_state[k] = v.clone().float()
-            else:
-                for k, v in state.items():
-                    avg_state[k] += v.float()
-        # Average
-        for k in avg_state:
-            avg_state[k] /= float(len(selected))
-        # Load into model
-        self.model.load_state_dict(avg_state)
-        self.model.to(self.device)
+        # Decoding hyperparameters
+        self.beam_size: int = int(self.config.get("decoding.beam_size", 4))
+        self.length_penalty: float = float(self.config.get("decoding.length_penalty", 0.6))
+        self.max_offset: int = int(self.config.get("decoding.max_output_length_offset", 50))
 
-    def _load_tokenizer(self) -> None:
-        """
-        Load the SentencePiece model used for tokenization.
-        """
-        data_cfg = self.config["data"]
-        vocab_size = int(data_cfg["vocab_size"])
-        # Assume SentencePiece model file is named spm_{vocab_size}.model
-        spm_path = f"spm_{vocab_size}.model"
-        if not os.path.isfile(spm_path):
-            raise FileNotFoundError(f"SentencePiece model not found: {spm_path}")
-        sp = SentencePieceProcessor()
-        sp.Load(spm_path)
-        self.tokenizer = sp
+        # Load target tokenizer to decode token IDs to text
+        tok_dir: str = self.config.get("data.tokenizer_dir", "tokenizers")
+        vocab_type: str = self.config.get("data.vocab_type", "bpe")
+        tgt_tok_file = os.path.join(tok_dir, f"tgt_{vocab_type}_tokenizer.json")
+        if not os.path.isfile(tgt_tok_file):
+            raise FileNotFoundError(f"Target tokenizer not found at {tgt_tok_file}")
+        self.tokenizer: Tokenizer = Tokenizer.from_file(tgt_tok_file)
+
         # Special token IDs
-        self.pad_id = sp.pad_id()
-        self.bos_id = sp.bos_id()
-        self.eos_id = sp.eos_id()
+        self.bos_id: int = self.tokenizer.token_to_id("<s>")
+        self.eos_id: int = self.tokenizer.token_to_id("</s>")
+
+        # Read reference lines for test set
+        test_tgt_path: str = self.config.get("data.test_tgt")
+        if not os.path.isfile(test_tgt_path):
+            raise FileNotFoundError(f"Test reference file not found: {test_tgt_path}")
+        with open(test_tgt_path, "r", encoding="utf-8") as f:
+            self.references: List[str] = [line.strip() for line in f]
+
+        # Pointer into reference list
+        self._ref_index: int = 0
+
+        # Device
+        self.device = next(self.model.parameters()).device
+        self.model.eval()
 
     def evaluate(self) -> Dict[str, float]:
         """
-        Perform evaluation on the test set: compute average token loss and BLEU.
+        Decode the entire test set and compute corpus BLEU.
 
         Returns:
-            A dict with keys "bleu" (float BLEU score) and "loss" (avg loss per token).
+            A dict with key 'bleu' and the BLEU score.
         """
-        self.model.eval()
-        total_loss = 0.0
-        total_tokens = 0
-        hypotheses: List[str] = []
-        references: List[List[str]] = []
-        with torch.no_grad():
-            for batch in self.test_loader:
-                # Move source tokens to device
-                src: Tensor = batch["src"].to(self.device)
-                # Prepare references by decoding tgt_output
-                tgt_out: Tensor = batch["tgt_output"]
-                for row in tgt_out.tolist():
-                    # trim at first EOS
-                    if self.eos_id in row:
-                        cut = row.index(self.eos_id)
-                        ids = row[:cut]
-                    else:
-                        ids = [tok for tok in row if tok != self.pad_id]
-                    ref_str = self._decode(ids)
-                    references.append([ref_str])
-                # Compute loss if target inputs are available
-                if "tgt_input" in batch:
-                    tgt_in: Tensor = batch["tgt_input"].to(self.device)
-                    tgt_out_dev: Tensor = tgt_out.to(self.device)
-                    logits: Tensor = self.model(src, tgt_in)
-                    B, T, V = logits.size()
-                    loss = self.loss_fn(
-                        logits.view(B * T, V), tgt_out_dev.view(B * T)
-                    )
-                    total_loss += loss.item()
-                    nonpad = (tgt_out_dev != self.pad_id).sum().item()
-                    total_tokens += nonpad
-                # Decode each example with beam search
-                for i in range(src.size(0)):
-                    single_src = src[i : i + 1, :]
-                    pred_ids = self._beam_search(single_src)
-                    hypotheses.append(self._decode(pred_ids))
-        avg_loss = total_loss / total_tokens if total_tokens > 0 else 0.0
-        # sacrebleu expects list of hyps and list of lists of refs (transposed)
-        bleu = sacrebleu.corpus_bleu(
-            hypotheses, list(zip(*references)), lowercase=False
-        )
-        return {"bleu": float(bleu.score), "loss": avg_loss}
+        all_hyps: List[str] = []
+        all_refs: List[str] = []
 
-    def _beam_search(self, src: Tensor) -> List[int]:
+        # Disable gradient computations
+        with torch.no_grad():
+            for batch in tqdm(self.test_loader, desc="Evaluating", unit="batch"):
+                src_batch: torch.Tensor = batch["src"].to(self.device)
+                batch_size, src_len = src_batch.size()
+                max_len = src_len + self.max_offset
+
+                for i in range(batch_size):
+                    single_src = src_batch[i : i + 1]  # (1, src_len)
+                    # Beam-search decode this single example
+                    pred_tokens = self._beam_search(single_src, max_len)
+
+                    # Strip BOS
+                    if pred_tokens and pred_tokens[0] == self.bos_id:
+                        pred_tokens = pred_tokens[1:]
+                    # Truncate at EOS
+                    if self.eos_id in pred_tokens:
+                        idx = pred_tokens.index(self.eos_id)
+                        pred_tokens = pred_tokens[:idx]
+
+                    # Decode token IDs to string
+                    hyp = self.tokenizer.decode(pred_tokens, skip_special_tokens=True)
+
+                    # Reference string
+                    if self._ref_index >= len(self.references):
+                        # Safety check
+                        raise IndexError("Reference index out of range during evaluation.")
+                    ref = self.references[self._ref_index]
+                    self._ref_index += 1
+
+                    all_hyps.append(hyp)
+                    all_refs.append(ref)
+
+        # Compute corpus BLEU
+        # sacrebleu expects list of hyps and list of list of refs
+        bleu = sacrebleu.corpus_bleu(all_hyps, [all_refs]).score
+        return {"bleu": bleu}
+
+    def _beam_search(
+        self,
+        src: torch.Tensor,
+        max_len: int
+    ) -> List[int]:
         """
-        Beam-search decode a single source sequence.
+        Perform beam-search decoding for a single source example.
 
         Args:
-            src: Tensor of shape (1, src_len)
+            src: Tensor of shape (1, src_len) of source token IDs.
+            max_len: Maximum output length.
 
         Returns:
-            A list of token IDs (excluding initial BOS and final EOS).
+            List of token IDs for the best hypothesis (including BOS/EOS).
         """
-        # Encode source once
-        memory = self.model.encode(src, src_mask=None)
-        # Initialize beam
-        beams: List[BeamEntry] = [BeamEntry(seq=[self.bos_id], logprob=0.0)]
-        completed: List[BeamEntry] = []
-        max_len = src.size(1) + self.max_len_offset
+        # Beam entries: dict with 'tokens' and 'logprob'
+        beams = [{"tokens": [self.bos_id], "logprob": 0.0}]
+        completed = []
 
         for _ in range(max_len):
-            all_candidates: List[BeamEntry] = []
-            for entry in beams:
-                seq, logp = entry.seq, entry.logprob
-                # If already ended, carry over
-                if seq[-1] == self.eos_id:
-                    completed.append(entry)
+            new_beams = []
+            # Expand each beam
+            for beam in beams:
+                last_token = beam["tokens"][-1]
+                # If already ended, carry forward
+                if last_token == self.eos_id:
+                    completed.append(beam)
                     continue
+
                 # Prepare decoder input
-                tgt = torch.tensor([seq], dtype=torch.long, device=self.device)
-                # Decode step
-                dec_out = self.model.decode(tgt, memory, src_mask=None, tgt_mask=None)
-                # Get last token logits and log-probs
-                logits = dec_out[:, -1, :]  # (1, vocab_size)
-                log_probs = F.log_softmax(logits, dim=-1).squeeze(0)
-                # Top-K expansions
-                topk_logp, topk_ids = log_probs.topk(self.beam_size)
-                for k in range(self.beam_size):
-                    new_seq = seq + [int(topk_ids[k].item())]
-                    new_logp = logp + float(topk_logp[k].item())
-                    all_candidates.append(BeamEntry(seq=new_seq, logprob=new_logp))
-            # If no unfinished candidates, break
-            if not all_candidates:
+                dec_input = torch.tensor(
+                    beam["tokens"], dtype=torch.long, device=self.device
+                ).unsqueeze(0)  # (1, cur_len)
+
+                # Forward pass (model builds its own masks)
+                logits = self.model(src, dec_input)  # (1, cur_len, vocab_size)
+                log_probs = F.log_softmax(logits[0, -1, :], dim=-1)  # (vocab_size,)
+
+                # Top-k tokens
+                topk_logp, topk_ids = torch.topk(log_probs, self.beam_size)
+                for logp, idx in zip(topk_logp.tolist(), topk_ids.tolist()):
+                    new_beams.append({
+                        "tokens": beam["tokens"] + [int(idx)],
+                        "logprob": beam["logprob"] + float(logp)
+                    })
+
+            # If no expansions (all beams completed), stop
+            if not new_beams:
                 break
-            # Apply length penalty and select top beams
-            def score_norm(be: BeamEntry) -> float:
-                length = len(be.seq)
-                lp = ((5.0 + length) ** self.length_penalty) / ((5.0 + 1.0) ** self.length_penalty)
-                return be.logprob / lp
 
-            # Keep top beam_size candidates
-            beams = sorted(all_candidates, key=score_norm, reverse=True)[: self.beam_size]
+            # Prune to beam_size by length-normalized score
+            def score_norm(entry: Dict[str, float]) -> float:
+                length = len(entry["tokens"])
+                # avoid division by zero
+                return entry["logprob"] / (length ** self.length_penalty)  
 
-        # If we have completed hypotheses, choose best among them
-        final_beams = completed if completed else beams
-        best = max(final_beams, key=lambda be: score_norm(be))
-        # Strip BOS and EOS
-        seq = best.seq
-        # Remove initial BOS
-        if seq and seq[0] == self.bos_id:
-            seq = seq[1:]
-        # Truncate at EOS if present
-        if self.eos_id in seq:
-            eos_pos = seq.index(self.eos_id)
-            seq = seq[:eos_pos]
-        return seq
+            # Select top beams
+            beams = sorted(new_beams, key=score_norm, reverse=True)[: self.beam_size]
 
-    def _decode(self, ids: List[int]) -> str:
-        """
-        Decode a list of token IDs to a string via the tokenizer.
+            # Early stopping if all current beams have ended
+            if all(b["tokens"][-1] == self.eos_id for b in beams):
+                completed.extend(beams)
+                break
 
-        Args:
-            ids: List of token IDs.
+        # If no completed hypotheses, use current beams
+        if not completed:
+            completed = beams
 
-        Returns:
-            Decoded string.
-        """
-        # Try common SentencePiece decode methods
-        if hasattr(self.tokenizer, "decode_ids"):
-            return self.tokenizer.decode_ids(ids)
-        if hasattr(self.tokenizer, "DecodeIds"):
-            return self.tokenizer.DecodeIds(ids)
-        if hasattr(self.tokenizer, "decode"):
-            return self.tokenizer.decode(ids)
-        # Fallback: join IDs (not ideal)
-        return " ".join(str(i) for i in ids)
+        # Return the best completed hypothesis
+        best = max(completed, key=lambda b: b["logprob"] / (len(b["tokens"]) ** self.length_penalty))
+        return best["tokens"]

@@ -1,295 +1,267 @@
-# dataset_loader.py
+## dataset_loader.py
 
 import os
 import json
-from typing import Any, Dict, List, Tuple, Optional
+from typing import Tuple, List, Dict
 
 import torch
 from torch.utils.data import Dataset, DataLoader, Sampler
-from tokenizers import ByteLevelBPETokenizer
 
-from config import Config
-import utils
+from tokenizers import Tokenizer
+from tokenizers.models import BPE, WordPiece
+from tokenizers.trainers import BpeTrainer, WordPieceTrainer
+from tokenizers.pre_tokenizers import Whitespace
+from tokenizers.processors import TemplateProcessing
 
-
-class WMTDataset(Dataset):
-    """Dataset wrapping tokenized source-target pairs."""
-
-    def __init__(self, pairs: List[Tuple[List[int], List[int]]]) -> None:
-        """
-        Args:
-            pairs: List of (src_token_ids, tgt_token_ids).
-        """
-        self.pairs = pairs
-
-    def __len__(self) -> int:
-        return len(self.pairs)
-
-    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        src_ids, tgt_ids = self.pairs[idx]
-        return {
-            "src": torch.tensor(src_ids, dtype=torch.long),
-            "tgt": torch.tensor(tgt_ids, dtype=torch.long),
-        }
-
-
-class TokenBatchSampler(Sampler[List[int]]):
-    """Batch sampler that groups examples by total tokens in source/target."""
-
-    def __init__(
-        self,
-        dataset: WMTDataset,
-        max_src_tokens: int,
-        max_tgt_tokens: int,
-        shuffle: bool = False,
-    ) -> None:
-        """
-        Args:
-            dataset: Instance of WMTDataset.
-            max_src_tokens: Maximum total source tokens per batch.
-            max_tgt_tokens: Maximum total target tokens per batch.
-            shuffle: Whether to shuffle the data each epoch.
-        """
-        self.dataset = dataset
-        self.max_src_tokens = max_src_tokens
-        self.max_tgt_tokens = max_tgt_tokens
-        self.shuffle = shuffle
-        self.indices = list(range(len(self.dataset)))
-
-    def __iter__(self):
-        if self.shuffle:
-            # In-place shuffle of indices
-            torch.random.manual_seed(torch.initial_seed())
-            self.indices = torch.randperm(len(self.dataset)).tolist()  # type: ignore
-
-        batch: List[int] = []
-        src_count = 0
-        tgt_count = 0
-
-        for idx in self.indices:
-            item = self.dataset[idx]
-            src_len = item["src"].size(0)
-            tgt_len = item["tgt"].size(0)
-            # If adding this example would exceed token budgets, yield current batch
-            if batch and (
-                src_count + src_len > self.max_src_tokens
-                or tgt_count + tgt_len > self.max_tgt_tokens
-            ):
-                yield batch
-                batch = []
-                src_count = 0
-                tgt_count = 0
-
-            batch.append(idx)
-            src_count += src_len
-            tgt_count += tgt_len
-
-        if batch:
-            yield batch
-
-    def __len__(self) -> int:
-        # Rough estimate (may be off): total_examples / average batch size
-        return len(self.dataset)
+from utils import Config
 
 
 class DatasetLoader:
-    """Loads raw data, builds tokenizer, and provides DataLoaders."""
+    """
+    Loads parallel corpora, builds or loads subword tokenizers,
+    encodes text into integer sequences, and constructs PyTorch
+    DataLoaders with dynamic batching by token count.
+    """
 
     def __init__(self, config: Config) -> None:
-        """
-        Args:
-            config: Configuration object.
-        """
-        self.config = config
-        # Parse language pair, e.g., "en-de"
-        pair = self.config.get("data.language_pair", "")
-        if not pair or "-" not in pair:
-            raise ValueError(
-                f"Invalid language_pair '{pair}' in config; expected format 'src-tgt'"
-            )
-        self.src_lang, self.tgt_lang = pair.split("-", 1)
-        self.dataset_name = self.config.get("data.train_dataset")
-        self.vocab_type = self.config.get("data.vocab.type", "byte-pair")
-        self.vocab_size = self.config.get("data.vocab.size", 37000)
-        # Batch token limits
-        self.max_src_tokens = self.config.get("training.batch.max_source_tokens", 25000)
-        self.max_tgt_tokens = self.config.get("training.batch.max_target_tokens", 25000)
-        # Number of DataLoader workers
-        gpus = self.config.get("hardware.gpus", 0)
-        self.num_workers = gpus if isinstance(gpus, int) and gpus > 0 else 0
-        # Tokenizer storage directory
-        # e.g., "./tokenizer/en-de/"
-        self.tokenizer_dir = os.path.join("tokenizer", pair)
-        # Prepare or load tokenizer
-        self.tokenizer = self._prepare_tokenizer()
-        # Padding token id
-        pad_id = self.tokenizer.token_to_id("<pad>")
-        self.pad_token_id = pad_id if pad_id is not None else 0
-        # Device for tensors
-        self.device = utils.get_device(self.config)
+        # Data file paths
+        self.train_src_path: str = config.get("data.train_src")
+        self.train_tgt_path: str = config.get("data.train_tgt")
+        self.val_src_path: str = config.get("data.val_src")
+        self.val_tgt_path: str = config.get("data.val_tgt")
+        self.test_src_path: str = config.get("data.test_src")
+        self.test_tgt_path: str = config.get("data.test_tgt")
 
-    def _prepare_tokenizer(self) -> ByteLevelBPETokenizer:
-        """
-        Loads an existing tokenizer if found, else trains a new one.
+        # Tokenizer settings
+        self.vocab_type: str = config.get("data.vocab_type", "bpe")
+        self.vocab_size: int = config.get("data.vocab_size", 37000)
 
-        Returns:
-            A ByteLevelBPETokenizer instance.
-        """
+        # Batching
+        self.max_tokens_per_batch: int = config.get(
+            "data.max_tokens_per_batch", 25000
+        )
+
+        # Optional: number of worker processes for DataLoader
+        self.num_workers: int = config.get("data.num_workers", 4)
+
+        # Tokenizers (to be built or loaded)
+        self.src_tokenizer: Tokenizer = None  # type: ignore
+        self.tgt_tokenizer: Tokenizer = None  # type: ignore
+
+        # Where to save/load tokenizer files
+        self.tokenizer_dir: str = config.get("data.tokenizer_dir", "tokenizers")
         os.makedirs(self.tokenizer_dir, exist_ok=True)
-        vocab_path = os.path.join(self.tokenizer_dir, "vocab.json")
-        merges_path = os.path.join(self.tokenizer_dir, "merges.txt")
-        # If vocab/merges exist, load
-        if os.path.isfile(vocab_path) and os.path.isfile(merges_path):
-            tokenizer = ByteLevelBPETokenizer(vocab_path, merges_path, lowercase=False)
-            return tokenizer
 
-        # Else train a new tokenizer
-        # Expect raw data in data/{dataset_name}/train.{lang}
-        data_root = os.path.join("data", self.dataset_name)
-        src_file = os.path.join(data_root, f"train.{self.src_lang}")
-        tgt_file = os.path.join(data_root, f"train.{self.tgt_lang}")
-        if not os.path.isfile(src_file) or not os.path.isfile(tgt_file):
-            raise FileNotFoundError(
-                f"Training files not found at '{src_file}' or '{tgt_file}'."
-            )
-
-        tokenizer = ByteLevelBPETokenizer()
-        tokenizer.train(
-            files=[src_file, tgt_file],
-            vocab_size=self.vocab_size,
-            special_tokens=["<pad>", "<s>", "</s>", "<unk>"],
+    def build_tokenizers(self) -> None:
+        """
+        Train or load source and target tokenizers based on config.
+        """
+        # Filenames for tokenizer artifacts
+        src_tok_file = os.path.join(
+            self.tokenizer_dir, f"src_{self.vocab_type}_tokenizer.json"
         )
-        # Save to tokenizer_dir
-        tokenizer.save_model(self.tokenizer_dir)
-        # Reload to ensure consistency
-        tokenizer = ByteLevelBPETokenizer(vocab_path, merges_path, lowercase=False)
-        return tokenizer
-
-    def _read_raw_data(self, split: str) -> List[Tuple[str, str]]:
-        """
-        Reads parallel source-target raw text.
-
-        Args:
-            split: One of "train", "val", "test".
-
-        Returns:
-            List of (src_line, tgt_line) pairs.
-        """
-        data_root = os.path.join("data", self.dataset_name)
-        src_path = os.path.join(data_root, f"{split}.{self.src_lang}")
-        tgt_path = os.path.join(data_root, f"{split}.{self.tgt_lang}")
-        if not os.path.isfile(src_path) or not os.path.isfile(tgt_path):
-            raise FileNotFoundError(
-                f"Data files for split '{split}' not found at "
-                f"'{src_path}' or '{tgt_path}'."
-            )
-
-        pairs: List[Tuple[str, str]] = []
-        with open(src_path, "r", encoding="utf-8") as fs, open(
-            tgt_path, "r", encoding="utf-8"
-        ) as ft:
-            for s_line, t_line in zip(fs, ft):
-                s = s_line.strip()
-                t = t_line.strip()
-                if s and t:
-                    pairs.append((s, t))
-        return pairs
-
-    def _encode_pairs(self, raw_pairs: List[Tuple[str, str]]) -> List[Tuple[List[int], List[int]]]:
-        """
-        Tokenizes and converts text pairs to ID sequences.
-
-        Args:
-            raw_pairs: List of (src_line, tgt_line).
-
-        Returns:
-            List of (src_ids, tgt_ids).
-        """
-        encoded: List[Tuple[List[int], List[int]]] = []
-        for src_text, tgt_text in raw_pairs:
-            src_enc = self.tokenizer.encode(src_text)
-            tgt_enc = self.tokenizer.encode(tgt_text)
-            encoded.append((src_enc.ids, tgt_enc.ids))
-        return encoded
-
-    def _collate_fn(self, batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
-        """
-        Collates and pads a list of examples into batched tensors and masks.
-
-        Args:
-            batch: List of dicts with 'src' and 'tgt' LongTensors.
-
-        Returns:
-            Dict with keys: 'src', 'tgt', 'src_mask', 'tgt_mask'.
-        """
-        src_seqs = [ex["src"] for ex in batch]
-        tgt_seqs = [ex["tgt"] for ex in batch]
-        batch_size = len(src_seqs)
-        # Determine max lengths
-        max_src_len = max([seq.size(0) for seq in src_seqs])
-        max_tgt_len = max([seq.size(0) for seq in tgt_seqs])
-        # Prepare padded tensors
-        padded_src = torch.full(
-            (batch_size, max_src_len),
-            fill_value=self.pad_token_id,
-            dtype=torch.long,
+        tgt_tok_file = os.path.join(
+            self.tokenizer_dir, f"tgt_{self.vocab_type}_tokenizer.json"
         )
-        padded_tgt = torch.full(
-            (batch_size, max_tgt_len),
-            fill_value=self.pad_token_id,
-            dtype=torch.long,
+
+        # If both exist, load and return
+        if os.path.isfile(src_tok_file) and os.path.isfile(tgt_tok_file):
+            self.src_tokenizer = Tokenizer.from_file(src_tok_file)
+            self.tgt_tokenizer = Tokenizer.from_file(tgt_tok_file)
+            return
+
+        # Otherwise, train new tokenizers
+        # Select model and trainer
+        if self.vocab_type.lower() == "bpe":
+            src_model = BPE(unk_token="<unk>")
+            tgt_model = BPE(unk_token="<unk>")
+            trainer = BpeTrainer(
+                vocab_size=self.vocab_size,
+                special_tokens=["<pad>", "<s>", "</s>", "<unk>"],
+            )
+        elif self.vocab_type.lower() == "wordpiece":
+            src_model = WordPiece(unk_token="<unk>")
+            tgt_model = WordPiece(unk_token="<unk>")
+            trainer = WordPieceTrainer(
+                vocab_size=self.vocab_size,
+                special_tokens=["<pad>", "<s>", "</s>", "<unk>"],
+            )
+        else:
+            raise ValueError(f"Unsupported vocab_type: {self.vocab_type}")
+
+        # Train source tokenizer
+        self.src_tokenizer = Tokenizer(src_model)
+        self.src_tokenizer.pre_tokenizer = Whitespace()
+        self.src_tokenizer.train([self.train_src_path], trainer)
+
+        # Train target tokenizer
+        self.tgt_tokenizer = Tokenizer(tgt_model)
+        self.tgt_tokenizer.pre_tokenizer = Whitespace()
+        self.tgt_tokenizer.train([self.train_tgt_path], trainer)
+
+        # Post-processing: add start/end tokens
+        src_s_id = self.src_tokenizer.token_to_id("<s>")
+        src_e_id = self.src_tokenizer.token_to_id("</s>")
+        self.src_tokenizer.post_processor = TemplateProcessing(
+            single="<s> $A </s>",
+            pair="<s> $A </s> <s> $B </s>",
+            special_tokens=[("<s>", src_s_id), ("</s>", src_e_id)],
         )
-        for i, seq in enumerate(src_seqs):
-            padded_src[i, : seq.size(0)] = seq
-        for i, seq in enumerate(tgt_seqs):
-            padded_tgt[i, : seq.size(0)] = seq
 
-        # Create masks
-        src_mask = utils.create_padding_mask(padded_src, self.pad_token_id)
-        tgt_mask = utils.create_combined_mask(padded_tgt, self.pad_token_id)
+        tgt_s_id = self.tgt_tokenizer.token_to_id("<s>")
+        tgt_e_id = self.tgt_tokenizer.token_to_id("</s>")
+        self.tgt_tokenizer.post_processor = TemplateProcessing(
+            single="<s> $A </s>",
+            pair="<s> $A </s> <s> $B </s>",
+            special_tokens=[("<s>", tgt_s_id), ("</s>", tgt_e_id)],
+        )
 
-        # Move to device
-        padded_src = padded_src.to(self.device)
-        padded_tgt = padded_tgt.to(self.device)
-        src_mask = src_mask.to(self.device)
-        tgt_mask = tgt_mask.to(self.device)
+        # Save tokenizers to disk
+        self.src_tokenizer.save(src_tok_file)
+        self.tgt_tokenizer.save(tgt_tok_file)
 
-        return {
-            "src": padded_src,
-            "tgt": padded_tgt,
-            "src_mask": src_mask,
-            "tgt_mask": tgt_mask,
-        }
-
-    def load_data(self) -> Dict[str, DataLoader]:
+    def load_data(self) -> Tuple[DataLoader, DataLoader, DataLoader]:
         """
-        Builds DataLoaders for train, val, and test splits.
-
-        Returns:
-            Dict mapping split names to DataLoaders.
+        Build tokenizers (if needed), create Datasets and DataLoaders
+        for train, validation, and test splits.
         """
-        loaders: Dict[str, DataLoader] = {}
-        for split in ["train", "val", "test"]:
-            # 1) Read raw sentences
-            raw = self._read_raw_data(split)
-            # 2) Encode to ID sequences
-            encoded = self._encode_pairs(raw)
-            # 3) Build dataset
-            dataset = WMTDataset(encoded)
-            # 4) Build sampler
-            sampler = TokenBatchSampler(
-                dataset,
-                max_src_tokens=self.max_src_tokens,
-                max_tgt_tokens=self.max_tgt_tokens,
-                shuffle=(split == "train"),
+        # Ensure tokenizers exist
+        if self.src_tokenizer is None or self.tgt_tokenizer is None:
+            self.build_tokenizers()
+
+        # Inner dataset for parallel text
+        class ParallelTextDataset(Dataset):
+            def __init__(
+                self,
+                src_path: str,
+                tgt_path: str,
+                src_tokenizer: Tokenizer,
+                tgt_tokenizer: Tokenizer,
+            ):
+                # Read lines
+                with open(src_path, "r", encoding="utf-8") as f_src:
+                    self.src_lines = [line.strip() for line in f_src]
+                with open(tgt_path, "r", encoding="utf-8") as f_tgt:
+                    self.tgt_lines = [line.strip() for line in f_tgt]
+                assert len(self.src_lines) == len(
+                    self.tgt_lines
+                ), "Source and target files must have same number of lines."
+                self.src_tokenizer = src_tokenizer
+                self.tgt_tokenizer = tgt_tokenizer
+
+            def __len__(self) -> int:
+                return len(self.src_lines)
+
+            def __getitem__(self, idx: int) -> Dict[str, torch.LongTensor]:
+                src_enc = self.src_tokenizer.encode(self.src_lines[idx])
+                tgt_enc = self.tgt_tokenizer.encode(self.tgt_lines[idx])
+                return {
+                    "src_ids": torch.tensor(src_enc.ids, dtype=torch.long),
+                    "tgt_ids": torch.tensor(tgt_enc.ids, dtype=torch.long),
+                }
+
+        # Instantiate datasets
+        train_dataset = ParallelTextDataset(
+            self.train_src_path,
+            self.train_tgt_path,
+            self.src_tokenizer,
+            self.tgt_tokenizer,
+        )
+        val_dataset = ParallelTextDataset(
+            self.val_src_path,
+            self.val_tgt_path,
+            self.src_tokenizer,
+            self.tgt_tokenizer,
+        )
+        test_dataset = ParallelTextDataset(
+            self.test_src_path,
+            self.test_tgt_path,
+            self.src_tokenizer,
+            self.tgt_tokenizer,
+        )
+
+        # Custom sampler for dynamic batching by token count
+        class TokenBucketSampler(Sampler[List[int]]):
+            def __init__(self, dataset: ParallelTextDataset, max_tokens: int):
+                self.dataset = dataset
+                self.max_tokens = max_tokens
+
+            def __iter__(self):
+                bucket: List[int] = []
+                tokens_in_bucket = 0
+                for idx in range(len(self.dataset)):
+                    item = self.dataset[idx]
+                    # count both src and tgt tokens
+                    n_tokens = item["src_ids"].size(0) + item["tgt_ids"].size(0)
+                    # if adding this item exceeds budget, yield current bucket
+                    if bucket and tokens_in_bucket + n_tokens > self.max_tokens:
+                        yield bucket
+                        bucket = []
+                        tokens_in_bucket = 0
+                    bucket.append(idx)
+                    tokens_in_bucket += n_tokens
+                # yield any remaining
+                if bucket:
+                    yield bucket
+
+            def __len__(self) -> int:
+                # approximate number of batches
+                total_tokens = 0
+                for idx in range(len(self.dataset)):
+                    item = self.dataset[idx]
+                    total_tokens += (
+                        item["src_ids"].size(0) + item["tgt_ids"].size(0)
+                    )
+                return max(1, total_tokens // self.max_tokens)
+
+        # Collate function for padding
+        def pad_collate_fn(batch_items: List[Dict[str, torch.LongTensor]]):
+            # Extract pad IDs
+            pad_src = self.src_tokenizer.token_to_id("<pad>")
+            pad_tgt = self.tgt_tokenizer.token_to_id("<pad>")
+
+            # Compute max lengths
+            max_src_len = max(item["src_ids"].size(0) for item in batch_items)
+            max_tgt_len = max(item["tgt_ids"].size(0) for item in batch_items)
+
+            # Prepare batched tensors
+            batch_size = len(batch_items)
+            src_batch = torch.full(
+                (batch_size, max_src_len), pad_src, dtype=torch.long
             )
-            # 5) DataLoader
-            loader = DataLoader(
-                dataset,
-                batch_sampler=sampler,
-                collate_fn=self._collate_fn,
-                pin_memory=True,
-                num_workers=self.num_workers,
+            tgt_batch = torch.full(
+                (batch_size, max_tgt_len), pad_tgt, dtype=torch.long
             )
-            loaders[split] = loader
-        return loaders
+
+            for i, item in enumerate(batch_items):
+                src_len = item["src_ids"].size(0)
+                tgt_len = item["tgt_ids"].size(0)
+                src_batch[i, :src_len] = item["src_ids"]
+                tgt_batch[i, :tgt_len] = item["tgt_ids"]
+
+            return {"src": src_batch, "tgt": tgt_batch}
+
+        # DataLoaders
+        train_loader = DataLoader(
+            train_dataset,
+            batch_sampler=TokenBucketSampler(train_dataset, self.max_tokens_per_batch),
+            collate_fn=pad_collate_fn,
+            num_workers=self.num_workers,
+            pin_memory=True,
+        )
+        val_loader = DataLoader(
+            val_dataset,
+            batch_sampler=TokenBucketSampler(val_dataset, self.max_tokens_per_batch),
+            collate_fn=pad_collate_fn,
+            num_workers=self.num_workers,
+            pin_memory=True,
+        )
+        test_loader = DataLoader(
+            test_dataset,
+            batch_sampler=TokenBucketSampler(test_dataset, self.max_tokens_per_batch),
+            collate_fn=pad_collate_fn,
+            num_workers=self.num_workers,
+            pin_memory=True,
+        )
+
+        return train_loader, val_loader, test_loader

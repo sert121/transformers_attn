@@ -1,34 +1,22 @@
-# main.py
+## main.py
 
 import argparse
-import logging
 import os
-import random
 import sys
 
-import numpy as np
 import torch
-import torch.nn as nn
 
-from config import Config
+from utils import Config
 from dataset_loader import DatasetLoader
 from model import TransformerModel
 from trainer import Trainer
-from evaluator import Evaluator
-import utils
-
-
-def set_seed(seed: int) -> None:
-    """Fix random seeds for reproducibility."""
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
+from evaluation import Evaluator
 
 
 def parse_args():
-    """Parses command-line arguments."""
+    """
+    Parse command-line arguments.
+    """
     parser = argparse.ArgumentParser(
         description="Train and/or evaluate the Transformer model."
     )
@@ -36,95 +24,110 @@ def parse_args():
         "--config",
         type=str,
         required=True,
-        help="Path to YAML/JSON configuration file.",
+        help="Path to the YAML configuration file."
     )
     parser.add_argument(
         "--mode",
         type=str,
-        choices=["train", "eval", "all"],
-        default="all",
-        help="Mode of operation: 'train', 'eval', or 'all' (default: all).",
+        choices=["train", "eval", "train_eval"],
+        default="train_eval",
+        help="Operation mode: 'train', 'eval', or 'train_eval'."
     )
     parser.add_argument(
-        "--checkpoint",
+        "--ckpt",
         type=str,
         default=None,
-        help="Path to a checkpoint to load for resuming training or for evaluation.",
+        help="Path to a model checkpoint to load before training/evaluation."
+    )
+    parser.add_argument(
+        "--output_dir",
+        type=str,
+        default=None,
+        help="Directory to save outputs (checkpoints, logs, metrics). "
+             "If not set, uses config.training.ckpt_dir."
     )
     return parser.parse_args()
 
 
 def main():
+    """
+    Main entry point for training and evaluation.
+    """
     args = parse_args()
 
-    # Configure logging
-    logging.basicConfig(
-        level=logging.INFO,
-        format="[%(asctime)s] %(levelname)s: %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-        stream=sys.stdout,
-    )
-    logging.info("Starting Transformer experiment")
-
     # Load configuration
-    logging.info(f"Loading configuration from '{args.config}'")
-    config = Config(args.config)
+    try:
+        config = Config(args.config)
+    except Exception as e:
+        print(f"Error loading config file: {e}", file=sys.stderr)
+        sys.exit(1)
 
-    # Set random seeds
-    seed = config.get("training.seed", 42)
-    logging.info(f"Setting random seed to {seed}")
-    set_seed(seed)
+    # Determine output directory
+    output_dir = args.output_dir or config.get("training.ckpt_dir", "checkpoints")
+    os.makedirs(output_dir, exist_ok=True)
 
-    # Select device
-    device = utils.get_device(config)
-    logging.info(f"Using device: {device}")
+    # Build data loaders
+    print("Loading data and building tokenizers...")
+    loader = DatasetLoader(config)
+    train_loader, val_loader, test_loader = loader.load_data()
+    print("Data loaders are ready.")
 
-    # Prepare data
-    logging.info("Loading datasets and tokenizers...")
-    data_loader = DatasetLoader(config)
-    dataloaders = data_loader.load_data()
-    logging.info(
-        f"Loaded splits: {', '.join(dataloaders.keys())}; "
-        f"Train batches: {len(dataloaders['train'])}"
-    )
-
-    # Build model
-    logging.info("Building Transformer model...")
+    # Initialize model
+    print("Initializing Transformer model...")
     model = TransformerModel(config)
-    model.to(device)
 
     # Multi-GPU support
-    num_gpus = config.get("hardware.gpus", 0)
-    if device.type == "cuda" and isinstance(num_gpus, int) and num_gpus > 1:
-        logging.info(f"Wrapping model with DataParallel on {num_gpus} GPUs")
-        model = nn.DataParallel(model)
+    if torch.cuda.device_count() > 1:
+        print(f"Detected {torch.cuda.device_count()} GPUs, using DataParallel.")
+        model = torch.nn.DataParallel(model)
 
-    # Training phase
-    if args.mode in ("train", "all"):
-        logging.info("Initializing Trainer...")
-        trainer = Trainer(config, model, dataloaders)
-        if args.checkpoint:
-            logging.info(f"Resuming training from checkpoint '{args.checkpoint}'")
-            trainer.load_checkpoint(args.checkpoint)
+    # Load checkpoint if provided
+    if args.ckpt:
+        if not os.path.isfile(args.ckpt):
+            print(f"Checkpoint file not found: {args.ckpt}", file=sys.stderr)
+            sys.exit(1)
+        print(f"Loading checkpoint from {args.ckpt} ...")
+        # if DataParallel, unwrap
+        m = model.module if isinstance(model, torch.nn.DataParallel) else model
+        m.load(args.ckpt)
+        print("Checkpoint loaded.")
+
+    # TRAINING
+    if args.mode in ("train", "train_eval"):
+        print("Starting training...")
+        trainer = Trainer(
+            model=model,
+            train_loader=train_loader,
+            val_loader=val_loader,
+            config=config
+        )
         trainer.train()
+        print("Training finished.")
 
-    # Evaluation phase
-    if args.mode in ("eval", "all"):
-        # Determine which checkpoint to load
-        if args.checkpoint:
-            ckpt_path = args.checkpoint
+    # EVALUATION
+    if args.mode in ("eval", "train_eval"):
+        # Ensure model is in eval mode
+        model.eval()
+        print("Starting evaluation...")
+        evaluator = Evaluator(
+            model=model,
+            test_loader=test_loader,
+            config=config
+        )
+        metrics = evaluator.evaluate()
+        bleu = metrics.get("bleu", None)
+        if bleu is not None:
+            print(f"Corpus BLEU = {bleu:.2f}")
         else:
-            ckpt_dir = config.get("training.checkpoint_dir", "checkpoints")
-            ckpt_path = os.path.join(ckpt_dir, "ckpt_final.pt")
-        logging.info(f"Evaluating with checkpoint '{ckpt_path}'")
+            print("No BLEU score computed.", file=sys.stderr)
+        # Save metrics to file
+        metrics_path = os.path.join(output_dir, "metrics.txt")
+        with open(metrics_path, "w", encoding="utf-8") as f:
+            for k, v in metrics.items():
+                f.write(f"{k}: {v}\n")
+        print(f"Metrics saved to {metrics_path}")
 
-        evaluator = Evaluator(config, model, dataloaders["test"])
-        metrics = evaluator.evaluate(checkpoint_path=ckpt_path)
-        logging.info("Evaluation results:")
-        for metric, value in metrics.items():
-            logging.info(f"  {metric}: {value}")
-
-    logging.info("Experiment finished.")
+    print("All done.")
 
 
 if __name__ == "__main__":
