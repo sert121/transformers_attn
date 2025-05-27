@@ -1,82 +1,142 @@
-## utils.py
+"""Utility functions for reproducible training, checkpointing, and data loading."""
 
+import os
+import random
+import logging
+from typing import Optional, Any
+
+import numpy as np
 import torch
-from typing import List, Tuple, Optional
+from torch.utils.data import DataLoader, Dataset
 
-import sacrebleu
+# Configure root logger if not already configured
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)-8s | %(name)-15s | %(message)s"
+)
+_logger = logging.getLogger(__name__)
 
 
-def create_masks(
-    src: torch.LongTensor,
-    tgt: Optional[torch.LongTensor],
-    pad_idx: int
-) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+def set_seed(seed: int) -> None:
     """
-    Create boolean masks for source and target sequences to be used
-    in the Transformer model's attention mechanisms.
+    Set all random seeds for reproducibility.
 
     Args:
-        src: Tensor of shape (batch_size, src_len) containing source token IDs.
-        tgt: Tensor of shape (batch_size, tgt_len) containing target token IDs,
-             or None if only source mask is needed.
-        pad_idx: Integer ID of the padding token.
+        seed (int): Seed value to use for all RNGs.
+    """
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    # Ensure deterministic behavior in cudnn
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    _logger.info(f"Random seed set to {seed} for python, numpy, and torch.")
+
+
+def make_dataloader(
+    dataset: Dataset,
+    batch_size: int,
+    shuffle: bool
+) -> DataLoader:
+    """
+    Wrap a torch Dataset into a DataLoader with sensible defaults.
+
+    Args:
+        dataset (torch.utils.data.Dataset): Dataset returning dicts or tensors.
+        batch_size (int): Number of examples per batch.
+        shuffle (bool): Whether to shuffle the data at every epoch.
 
     Returns:
-        A tuple (src_mask, tgt_mask) where:
-          - src_mask is a boolean tensor of shape (batch_size, 1, 1, src_len),
-            True at non-pad positions, False at pad positions.
-          - tgt_mask is a boolean tensor of shape (batch_size, 1, tgt_len, tgt_len),
-            combining padding mask and look-ahead mask, or None if tgt is None.
+        torch.utils.data.DataLoader: Configured DataLoader instance.
     """
-    # Source padding mask: True where src != pad_idx
-    # Shape: (batch_size, src_len)
-    src_pad_mask = (src != pad_idx)
-    # Shape: (batch_size, 1, 1, src_len)
-    src_mask = src_pad_mask.unsqueeze(1).unsqueeze(2)
+    num_workers_env = os.environ.get("NUM_WORKERS")
+    try:
+        num_workers = int(num_workers_env) if num_workers_env is not None else 4
+    except ValueError:
+        num_workers = 4
+    pin_memory = torch.cuda.is_available()
 
-    if tgt is None:
-        return src_mask, None
-
-    # Target padding mask: True where tgt != pad_idx
-    # Shape: (batch_size, tgt_len)
-    tgt_pad_mask = (tgt != pad_idx)
-    # Shape: (batch_size, 1, 1, tgt_len)
-    tgt_pad_mask = tgt_pad_mask.unsqueeze(1).unsqueeze(2)
-
-    # Look-ahead mask: lower-triangular matrix of shape (tgt_len, tgt_len)
-    tgt_len = tgt.size(1)
-    device = tgt.device
-    # dtype=torch.bool for boolean masking
-    look_ahead = torch.tril(
-        torch.ones((tgt_len, tgt_len), dtype=torch.bool, device=device)
+    loader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        collate_fn=None  # Assumes dataset returns already-tensorized, padded batches
     )
-    # Shape: (1, 1, tgt_len, tgt_len)
-    look_ahead = look_ahead.unsqueeze(0).unsqueeze(0)
-
-    # Combine padding and look-ahead masks
-    # tgt_mask[i, 0, j, k] is True if position k is non-pad and k <= j
-    tgt_mask = tgt_pad_mask & look_ahead
-
-    return src_mask, tgt_mask
+    _logger.debug(
+        f"Created DataLoader(dataset={type(dataset).__name__}, "
+        f"batch_size={batch_size}, shuffle={shuffle}, "
+        f"num_workers={num_workers}, pin_memory={pin_memory})"
+    )
+    return loader
 
 
-def compute_bleu(
-    references: List[str],
-    hypotheses: List[str]
-) -> float:
+def save_checkpoint(
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    step: int,
+    ckpt_dir: str
+) -> str:
     """
-    Compute corpus-level BLEU score using sacrebleu.
+    Save model and optimizer state to a checkpoint file.
 
     Args:
-        references: List of reference sentences (strings).
-        hypotheses: List of hypothesis sentences (strings).
+        model (torch.nn.Module): Model to save.
+        optimizer (torch.optim.Optimizer): Optimizer to save.
+        step (int): Training step number, used in filename.
+        ckpt_dir (str): Directory in which to save checkpoints.
 
     Returns:
-        BLEU score as a float, e.g., 28.4.
+        str: Full path to the saved checkpoint file.
     """
-    if not references or not hypotheses:
-        return 0.0
-    # sacrebleu expects a list of reference-lists for multi-reference support
-    formatted_refs = [references]
-    bleu = sacrebleu.corpus_bleu(hypotheses, formatted_refs)
-    return float(bleu.score)
+    os.makedirs(ckpt_dir, exist_ok=True)
+    filename = f"checkpoint_step_{step}.pt"
+    ckpt_path = os.path.join(ckpt_dir, filename)
+
+    state = {
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "step": step
+    }
+    try:
+        torch.save(state, ckpt_path)
+        _logger.info(f"Saved checkpoint at step {step} to {ckpt_path}.")
+    except Exception as e:
+        _logger.error(f"Failed to save checkpoint at {ckpt_path}: {e}")
+        raise
+    return ckpt_path
+
+
+def load_checkpoint(
+    ckpt_path: str,
+    model: torch.nn.Module,
+    optimizer: Optional[torch.optim.Optimizer] = None
+) -> Optional[int]:
+    """
+    Load model (and optionally optimizer) state from a checkpoint file.
+
+    Args:
+        ckpt_path (str): Path to checkpoint file (.pt).
+        model (torch.nn.Module): Model into which to load the state.
+        optimizer (torch.optim.Optimizer, optional): Optimizer to restore state.
+
+    Returns:
+        Optional[int]: Loaded training step, or None if not present.
+    """
+    if not os.path.isfile(ckpt_path):
+        raise FileNotFoundError(f"Checkpoint file not found: {ckpt_path}")
+
+    try:
+        checkpoint = torch.load(ckpt_path, map_location="cpu")
+        model.load_state_dict(checkpoint["model_state_dict"])
+        if optimizer is not None and "optimizer_state_dict" in checkpoint:
+            optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        step = checkpoint.get("step", None)
+        _logger.info(f"Loaded checkpoint from {ckpt_path} at step {step}.")
+        return step
+    except Exception as e:
+        _logger.error(f"Error loading checkpoint from {ckpt_path}: {e}")
+        raise

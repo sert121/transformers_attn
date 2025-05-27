@@ -1,55 +1,66 @@
 ## config.yaml
 
-training:
-  # Total training steps for base Transformer
-  train_steps: 100000
-  # Batch size in tokens (approximate per device)
-  batch_source_tokens: 25000
-  batch_target_tokens: 25000
-  # Beam search settings for inference
-  beam_size: 4
-  length_penalty: 0.6
+# Data paths and preprocessing
+data:
+  train_src: "data/wmt14_en_de/train.en"
+  train_tgt: "data/wmt14_en_de/train.de"
+  dev_src:   "data/wmt14_en_de/newstest2013.en"
+  dev_tgt:   "data/wmt14_en_de/newstest2013.de"
+  test_src:  "data/wmt14_en_de/newstest2014.en"
+  test_tgt:  "data/wmt14_en_de/newstest2014.de"
+  max_seq_length: 100
 
-optimizer:
-  type: adam
-  beta1: 0.9
-  beta2: 0.98
-  epsilon: 1e-9
+# Subword vocabulary settings
+tokenizer:
+  type: "byte-pair"
+  vocab_size: 37000
+  merges: 37000
+  special_tokens:
+    - "<pad>"
+    - "<s>"
+    - "</s>"
+    - "<unk>"
 
-scheduler:
-  # Transformer-style warmup + inverse-sqrt decay
-  type: transformer
-  d_model: 512
-  warmup_steps: 4000
-
+# Model architecture hyperparameters
 model:
-  # Encoder and decoder layer counts
-  encoder_layers: 6
-  decoder_layers: 6
-  # Hidden dimensions
+  name: "transformer"
   d_model: 512
   d_ff: 2048
-  # Multi-head attention
-  n_heads: 8
-  d_k: 64
-  d_v: 64
-  # Dropout probability
-  dropout_rate: 0.1
+  num_layers: 6
+  num_heads: 8
+  dropout: 0.1
+  max_position_embeddings: 512
 
+# Training configuration
+training:
+  max_steps: 100000
+  batch_tokens: 25000        # approximate tokens per batch (source & target)
+  eval_steps: 10000          # dev evaluation interval
+  save_steps: 10000          # checkpoint interval
+  seed: 42
+
+# Optimizer settings
+optimizer:
+  type: "Adam"
+  betas: [0.9, 0.98]
+  epsilon: 1e-9
+
+# Learning rate scheduler
+scheduler:
+  type: "warmup_inverse_sqrt"
+  warmup_steps: 4000
+
+# Regularization
 regularization:
-  # Label smoothing on target distribution
   label_smoothing: 0.1
 
-data:
-  # WMT14 En→De settings
-  task: wmt14_en_de
-  tokenizer: byte_pair_encoding
-  shared_vocab: true
-  vocab_size: 37000
-  bpe_merges: 37000
-
-evaluation:
-  # At inference: max output length = input_length + max_offset
+# Inference / Decoding
+inference:
+  beam_size: 4
+  length_penalty: 0.6
   max_length_offset: 50
-  metrics:
-    - bleu
+
+# Logging and checkpoints
+logging:
+  log_dir: "logs/"
+  checkpoint_dir: "checkpoints/"

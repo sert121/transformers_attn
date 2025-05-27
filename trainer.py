@@ -1,76 +1,23 @@
-# trainer.py
+"""
+trainer.py
+
+Implements the training loop for the Transformer model as specified in
+'Attention Is All You Need'. Uses token-based batching, Adam optimizer with
+warmup-inverse-sqrt learning rate schedule, label smoothing, and periodic
+checkpointing.
+"""
 
 import os
 import time
-from typing import Optional
+from typing import Tuple
 
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.optim.lr_scheduler import LambdaLR
-from torch.utils.data import DataLoader
+from tqdm import tqdm
 
-from config import Config
-from utils import create_masks
-
-
-class LabelSmoothingLoss(nn.Module):
-    """
-    NLL loss with label smoothing.
-
-    Args:
-        vocab_size: Size of the vocabulary.
-        smoothing: Smoothing factor ε_ls.
-        pad_idx: Index of padding token to ignore.
-    """
-
-    def __init__(self, vocab_size: int, smoothing: float, pad_idx: int) -> None:
-        super(LabelSmoothingLoss, self).__init__()
-        assert 0.0 <= smoothing < 1.0, "Smoothing must be in [0,1)"
-        self.vocab_size = vocab_size
-        self.smoothing = smoothing
-        self.pad_idx = pad_idx
-        self.confidence = 1.0 - smoothing
-        # KLDivLoss expects log-probabilities and smoothed target distributions
-        self.kl_div = nn.KLDivLoss(reduction="sum")
-
-    def forward(self, logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        """
-        Compute the loss.
-
-        Args:
-            logits: Tensor of shape (B, T, V) - raw model outputs.
-            target: Tensor of shape (B, T)   - true token indices.
-
-        Returns:
-            Scalar loss (averaged over non-pad tokens).
-        """
-        batch_size, seq_len, vocab_size = logits.size()
-        assert vocab_size == self.vocab_size
-
-        # Flatten inputs
-        n_tokens = batch_size * seq_len
-        log_probs = F.log_softmax(logits.view(-1, vocab_size), dim=-1)  # (N, V)
-        target_flat = target.view(-1)  # (N,)
-
-        # Build smoothed targets
-        with torch.no_grad():
-            # Initialize with uniform smoothing for all non-pad classes
-            true_dist = torch.full_like(log_probs, self.smoothing / (vocab_size - 1))
-            # Put confidence on the true labels
-            true_dist.scatter_(1, target_flat.unsqueeze(1), self.confidence)
-            # Zero out padding token distributions
-            true_dist[:, self.pad_idx] = 0
-            # Mask out positions where target is pad
-            pad_mask = target_flat == self.pad_idx
-            if pad_mask.any():
-                true_dist[pad_mask, :] = 0.0
-
-        # Compute KL divergence loss and normalize by number of non-pad tokens
-        loss = self.kl_div(log_probs, true_dist)
-        non_pad = (target_flat != self.pad_idx).sum().clamp_min(1)
-        return loss / non_pad
+import utils
 
 
 class Trainer:
@@ -78,163 +25,193 @@ class Trainer:
     Trainer for the Transformer model.
 
     Public methods:
-      - train() -> None
-      - save_checkpoint(path: str) -> None
-      - load_checkpoint(path: str) -> Optional[int]
+        __init__(model, datasets, config)
+        train() -> str  # returns path to the last saved checkpoint
     """
 
     def __init__(
         self,
-        model: nn.Module,
-        config: Config,
-        train_loader: DataLoader,
-        val_loader: DataLoader,
-    ) -> None:
+        model: torch.nn.Module,
+        datasets: Tuple[torch.utils.data.Dataset, torch.utils.data.Dataset],
+        config: object
+    ):
         """
         Args:
-            model:        The TransformerModel instance.
-            config:       Configuration object.
-            train_loader: DataLoader for training data.
-            val_loader:   DataLoader for validation data.
+            model (torch.nn.Module): TransformerModel instance.
+            datasets (tuple): (train_dataset, dev_dataset)
+            config: Config object with .get(section: str) -> dict interface.
         """
-        # Core objects
-        self.model = model
         self.config = config
-        self.train_loader = train_loader
-        self.val_loader = val_loader
+        self.model = model
 
-        # Device setup
+        # Unpack datasets
+        self.train_dataset, self.dev_dataset = datasets
+
+        # Device configuration
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        if torch.cuda.device_count() > 1:
+            # Wrap for multi-GPU
+            self.model = torch.nn.DataParallel(self.model)
         self.model.to(self.device)
 
-        # Extract training parameters
-        train_params = self.config.get_training_params()
-        self.train_steps = train_params["train_steps"]
-        # Directories
-        data_paths = self.config.get_data_paths()
-        self.checkpoint_dir = os.path.join(data_paths["output_dir"], "checkpoints")
-        os.makedirs(self.checkpoint_dir, exist_ok=True)
+        # Load training hyperparameters
+        training_cfg = config.get("training")
+        self.max_steps = int(training_cfg.get("max_steps", 100000))
+        self.batch_tokens = int(training_cfg.get("batch_tokens", 25000))
+        self.save_steps = int(training_cfg.get("save_steps", 10000))
+        # eval_steps may be unused here; evaluation happens outside Trainer
+        self.eval_steps = int(training_cfg.get("eval_steps", 10000))
 
-        # Optimizer: Adam with custom betas and epsilon
-        opt_cfg = self.config._cfg["optimizer"]
-        self.optimizer = optim.Adam(
-            self.model.parameters(),
-            betas=(float(opt_cfg.get("beta1", 0.9)), float(opt_cfg.get("beta2", 0.98))),
-            eps=float(opt_cfg.get("epsilon", 1e-9)),
+        # Optimizer settings
+        optim_cfg = config.get("optimizer")
+        betas = tuple(optim_cfg.get("betas", [0.9, 0.98]))
+        eps = float(optim_cfg.get("epsilon", 1e-9))
+
+        # Scheduler settings
+        sched_cfg = config.get("scheduler")
+        self.warmup_steps = int(sched_cfg.get("warmup_steps", 4000))
+
+        # Model dimension (for LR schedule) and label smoothing
+        model_cfg = config.get("model")
+        self.d_model = float(model_cfg.get("d_model", 512))
+        reg_cfg = config.get("regularization")
+        self.eps_ls = float(reg_cfg.get("label_smoothing", 0.1))
+
+        # Checkpoint directory
+        logging_cfg = config.get("logging")
+        self.checkpoint_dir = logging_cfg.get("checkpoint_dir", "checkpoints/")
+
+        # DataLoaders
+        self.train_loader = utils.make_dataloader(
+            self.train_dataset, self.batch_tokens, shuffle=True
+        )
+        self.dev_loader = utils.make_dataloader(
+            self.dev_dataset, self.batch_tokens, shuffle=False
         )
 
-        # Learning rate scheduler: Transformer schedule
-        sched_cfg = self.config._cfg["scheduler"]
-        d_model = float(sched_cfg.get("d_model", self.config.get_model_params()["d_model"]))
-        warmup_steps = int(sched_cfg.get("warmup_steps", 4000))
+        # Optimizer and learning rate scheduler
+        self.optimizer = optim.Adam(
+            self.model.parameters(),
+            lr=0.0,
+            betas=betas,
+            eps=eps
+        )
 
         def lr_lambda(step: int) -> float:
-            # step starts from 1
-            step = max(step, 1)
-            return (d_model ** -0.5) * min(step ** -0.5, step * (warmup_steps ** -1.5))
+            """Warmup-inverse-sqrt learning rate schedule."""
+            # avoid div by zero
+            step_val = max(step, 1)
+            return (self.d_model ** -0.5) * min(
+                step_val ** -0.5,
+                step_val * (self.warmup_steps ** -1.5)
+            )
 
-        self.scheduler = LambdaLR(self.optimizer, lr_lambda=lr_lambda)
+        self.scheduler = LambdaLR(self.optimizer, lr_lambda)
 
-        # Label smoothing criterion
-        reg_cfg = self.config._cfg["regularization"]
-        eps_ls = float(reg_cfg.get("label_smoothing", 0.1))
-        # Model should expose vocab size and pad_idx attributes
-        vocab_size = int(getattr(self.model, "vocab_size", None))
-        pad_idx = int(getattr(self.model, "pad_idx", 0))
-        self.criterion = LabelSmoothingLoss(vocab_size, eps_ls, pad_idx)
+        # Training state
+        self.global_step = 0
 
-        # Logging and checkpoint intervals (defaults)
-        self.log_interval = int(train_params.get("log_interval", 100))
-        self.ckpt_interval = int(train_params.get("ckpt_interval", 1000))
+        # Padding token index (assumed 0 by embedding padding_idx)
+        self.pad_idx = 0
 
-    def train(self) -> None:
+    def compute_loss(
+        self,
+        logits: torch.Tensor,
+        labels: torch.Tensor
+    ) -> torch.Tensor:
         """
-        Runs the training loop for the configured number of steps.
-        Logs loss and perplexity periodically and checkpoints the model.
+        Compute cross-entropy loss with optional label smoothing.
+
+        Args:
+            logits (Tensor): shape (batch_size, tgt_len, vocab_size)
+            labels (Tensor): shape (batch_size, tgt_len)
+
+        Returns:
+            Tensor: scalar loss.
+        """
+        batch_size, tgt_len, vocab_size = logits.size()
+        # Flatten
+        logits_flat = logits.view(-1, vocab_size)      # (N, V)
+        labels_flat = labels.view(-1)                  # (N,)
+
+        # Mask padding positions
+        mask = labels_flat.ne(self.pad_idx)            # (N,)
+        if self.eps_ls > 0.0:
+            # Log-probabilities
+            log_probs = F.log_softmax(logits_flat, dim=-1)
+            # Select non-pad positions
+            log_probs = log_probs[mask]                # (N_valid, V)
+            targets = labels_flat[mask].unsqueeze(1)   # (N_valid, 1)
+
+            # One-hot and smooth
+            smooth_dist = torch.full_like(
+                log_probs,
+                fill_value=self.eps_ls / float(vocab_size)
+            )
+            smooth_dist.scatter_(
+                dim=1,
+                index=targets,
+                value=1.0 - self.eps_ls
+            )
+            # Cross-entropy = -sum(P * log Q) / N_valid
+            loss = -(smooth_dist * log_probs).sum(dim=-1).mean()
+        else:
+            # Standard cross-entropy ignoring pad
+            loss = F.cross_entropy(
+                logits_flat,
+                labels_flat,
+                ignore_index=self.pad_idx
+            )
+        return loss
+
+    def train(self) -> str:
+        """
+        Run training loop for max_steps and save checkpoints every save_steps.
+
+        Returns:
+            str: Path to the last saved checkpoint.
         """
         self.model.train()
-        train_iter = iter(self.train_loader)
-        start_time = time.time()
+        last_ckpt_path = ""
 
-        for step in range(1, self.train_steps + 1):
-            # Fetch next batch (wrap-around)
-            try:
-                batch = next(train_iter)
-            except StopIteration:
-                train_iter = iter(self.train_loader)
-                batch = next(train_iter)
+        pbar = tqdm(total=self.max_steps, desc="Training", unit="step")
+        while self.global_step < self.max_steps:
+            for batch in self.train_loader:
+                if self.global_step >= self.max_steps:
+                    break
 
-            # Unpack and move to device
-            src = batch["src"].to(self.device)
-            tgt_input = batch["tgt_input"].to(self.device)
-            tgt_output = batch["tgt_output"].to(self.device)
+                # Move data to device
+                src_ids = batch["input_ids"].to(self.device)
+                tgt_ids = batch["labels"].to(self.device)
 
-            # Masks
-            src_mask, tgt_mask = create_masks(src, tgt_input, pad_idx=self.model.pad_idx)
-            src_mask = src_mask.to(self.device)
-            tgt_mask = tgt_mask.to(self.device)
+                # Forward pass
+                logits = self.model(src_ids, tgt_ids)
+                loss = self.compute_loss(logits, tgt_ids)
 
-            # Forward pass
-            logits = self.model(src, tgt_input, src_mask, tgt_mask)  # (B, T, V)
+                # Backward and optimization step
+                self.optimizer.zero_grad()
+                loss.backward()
+                self.optimizer.step()
+                self.scheduler.step()
 
-            # Compute loss
-            loss = self.criterion(logits, tgt_output)
-
-            # Backward and update
-            self.optimizer.zero_grad()
-            loss.backward()
-            self.optimizer.step()
-            self.scheduler.step()
-
-            # Logging
-            if step % self.log_interval == 0 or step == 1:
-                elapsed = time.time() - start_time
-                lr = self.scheduler.get_last_lr()[0]
-                ppl = torch.exp(loss).item()
-                print(
-                    f"[Step {step:>6}/{self.train_steps}] "
-                    f"Loss: {loss.item():.4f}  PPL: {ppl:>.2f}  LR: {lr:.6e}  "
-                    f"Time: {elapsed:.1f}s"
+                # Update step and progress bar
+                self.global_step += 1
+                pbar.update(1)
+                pbar.set_postfix(
+                    step=self.global_step,
+                    loss=f"{loss.item():.4f}"
                 )
-                start_time = time.time()
 
-            # Checkpointing
-            if step % self.ckpt_interval == 0 or step == self.train_steps:
-                ckpt_path = os.path.join(self.checkpoint_dir, f"ckpt_step{step}.pt")
-                self.save_checkpoint(ckpt_path)
+                # Checkpointing
+                if self.global_step % self.save_steps == 0:
+                    last_ckpt_path = utils.save_checkpoint(
+                        self.model,
+                        self.optimizer,
+                        self.global_step,
+                        self.checkpoint_dir
+                    )
+            # end for batch
+        # end while
 
-        print("Training complete.")
-
-    def save_checkpoint(self, path: str) -> None:
-        """
-        Saves model, optimizer, scheduler states and current step.
-
-        Args:
-            path: File path to save the checkpoint.
-        """
-        state = {
-            "model_state": self.model.state_dict(),
-            "optimizer_state": self.optimizer.state_dict(),
-            "scheduler_state": self.scheduler.state_dict(),
-        }
-        torch.save(state, path)
-        print(f"Checkpoint saved to {path}")
-
-    def load_checkpoint(self, path: str) -> Optional[int]:
-        """
-        Loads states from a checkpoint.
-
-        Args:
-            path: Path to the checkpoint file.
-        Returns:
-            The training step at which the checkpoint was saved, if available.
-        """
-        if not os.path.isfile(path):
-            raise FileNotFoundError(f"Checkpoint not found: {path}")
-        checkpoint = torch.load(path, map_location=self.device)
-        self.model.load_state_dict(checkpoint["model_state"])
-        self.optimizer.load_state_dict(checkpoint["optimizer_state"])
-        self.scheduler.load_state_dict(checkpoint["scheduler_state"])
-        print(f"Loaded checkpoint from {path}")
-        # If step was stored, return it; else, return None
-        return checkpoint.get("step", None)
+        pbar.close()
+        return last_ckpt_path
