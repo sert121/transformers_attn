@@ -1,133 +1,155 @@
-## main.py
+"""
+main.py
+
+Entry point for reproducing the Transformer experiments from
+"Attention Is All You Need". This script will:
+  1. Parse command-line arguments to get a config file path.
+  2. Load and validate the experiment configuration.
+  3. Build the dataset (SentencePiece vocab, data loaders).
+  4. Instantiate the Transformer model and optimizer.
+  5. Train the model according to the specified schedule.
+  6. Evaluate the model on the development set and report BLEU.
+"""
 
 import argparse
-import os
 import sys
+import time
+from typing import Optional
 
 import torch
 
-from utils import Config
+from config import Config
 from dataset_loader import DatasetLoader
 from model import TransformerModel
 from trainer import Trainer
-from evaluation import Evaluator
+from evaluation import Evaluation
 
 
-def parse_args():
+class Main:
+    """
+    Main orchestrator for the Transformer experiment.
+    """
+
+    def __init__(self, config_path: str) -> None:
+        """
+        Initialize the experiment:
+          - Load configuration
+          - Build/load vocabulary
+          - Prepare data loaders
+          - Instantiate model, optimizer, trainer, evaluator
+
+        Args:
+            config_path (str): Path to YAML or JSON config file.
+        """
+        start_time = time.time()
+        # 1) Load and validate configuration
+        print(f"[INFO] Loading configuration from: {config_path}")
+        self.config = Config(config_path)
+        print("[INFO] Configuration:")
+        self.config.dump()
+
+        # 2) Prepare dataset and tokenizer
+        print("[INFO] Building/loading SentencePiece vocabulary")
+        self.loader = DatasetLoader(self.config)
+
+        # Verify that train/dev splits are accessible (will raise if misconfigured)
+        print("[INFO] Verifying data splits")
+        _ = self.loader.load_data("train")
+        _ = self.loader.load_data("dev")
+
+        # 3) Instantiate model
+        print("[INFO] Instantiating Transformer model")
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.model = TransformerModel(self.config).to(self.device)
+
+        # 4) Build optimizer
+        print("[INFO] Setting up optimizer")
+        self.optimizer = self._build_optimizer()
+
+        # 5) Instantiate trainer and evaluator
+        print("[INFO] Initializing Trainer")
+        self.trainer = Trainer(
+            model=self.model,
+            optimizer=self.optimizer,
+            loader=self.loader,
+            config=self.config
+        )
+        print("[INFO] Initializing Evaluation harness")
+        self.evaluator = Evaluation(
+            model=self.model,
+            loader=self.loader,
+            config=self.config
+        )
+
+        elapsed = time.time() - start_time
+        print(f"[INFO] Initialization complete in {elapsed:.2f}s")
+
+    def _build_optimizer(self) -> torch.optim.Optimizer:
+        """
+        Build the optimizer as specified in config.optimizer.
+
+        Returns:
+            torch.optim.Optimizer: Configured optimizer.
+        Raises:
+            ValueError: If optimizer type is unsupported.
+        """
+        opt_cfg = self.config.optimizer
+        optim_type = opt_cfg.type.lower()
+        if optim_type == "adam":
+            optimizer = torch.optim.Adam(
+                params=self.model.parameters(),
+                betas=(opt_cfg.beta1, opt_cfg.beta2),
+                eps=opt_cfg.eps
+            )
+            return optimizer
+        else:
+            raise ValueError(f"Unsupported optimizer type: {opt_cfg.type}")
+
+    def run_experiment(self) -> None:
+        """
+        Execute the full experiment: training and evaluation.
+        """
+        print("[INFO] Starting training")
+        self.trainer.train()
+        print("[INFO] Training finished. Starting evaluation on dev set")
+        results = self.evaluator.evaluate(split="dev")
+        bleu = results.get("BLEU", None)
+        if bleu is not None:
+            print(f"[RESULT] Development set BLEU = {bleu:.2f}")
+        else:
+            print("[WARN] BLEU score not found in evaluation results")
+
+
+def parse_args() -> argparse.Namespace:
     """
     Parse command-line arguments.
+
+    Returns:
+        argparse.Namespace: Parsed arguments with attribute `config`.
     """
     parser = argparse.ArgumentParser(
-        description="Train and/or evaluate the Transformer model."
+        description="Reproduce 'Attention Is All You Need' experiments"
     )
     parser.add_argument(
         "--config",
         type=str,
         required=True,
-        help="Path to the YAML configuration file."
-    )
-    parser.add_argument(
-        "--mode",
-        type=str,
-        choices=["train", "eval", "train_eval"],
-        default="train_eval",
-        help="Operation mode: 'train', 'eval', or 'train_eval'."
-    )
-    parser.add_argument(
-        "--ckpt",
-        type=str,
-        default=None,
-        help="Path to a model checkpoint to load before training/evaluation."
-    )
-    parser.add_argument(
-        "--output_dir",
-        type=str,
-        default=None,
-        help="Directory to save outputs (checkpoints, logs, metrics). "
-             "If not set, uses config.training.ckpt_dir."
+        help="Path to the experiment configuration file (YAML or JSON)."
     )
     return parser.parse_args()
 
 
-def main():
+def main() -> None:
     """
-    Main entry point for training and evaluation.
+    Main entry point for the script.
     """
     args = parse_args()
-
-    # Load configuration
     try:
-        config = Config(args.config)
+        experiment = Main(config_path=args.config)
+        experiment.run_experiment()
     except Exception as e:
-        print(f"Error loading config file: {e}", file=sys.stderr)
+        print(f"[ERROR] Experiment failed: {e}", file=sys.stderr)
         sys.exit(1)
-
-    # Determine output directory
-    output_dir = args.output_dir or config.get("training.ckpt_dir", "checkpoints")
-    os.makedirs(output_dir, exist_ok=True)
-
-    # Build data loaders
-    print("Loading data and building tokenizers...")
-    loader = DatasetLoader(config)
-    train_loader, val_loader, test_loader = loader.load_data()
-    print("Data loaders are ready.")
-
-    # Initialize model
-    print("Initializing Transformer model...")
-    model = TransformerModel(config)
-
-    # Multi-GPU support
-    if torch.cuda.device_count() > 1:
-        print(f"Detected {torch.cuda.device_count()} GPUs, using DataParallel.")
-        model = torch.nn.DataParallel(model)
-
-    # Load checkpoint if provided
-    if args.ckpt:
-        if not os.path.isfile(args.ckpt):
-            print(f"Checkpoint file not found: {args.ckpt}", file=sys.stderr)
-            sys.exit(1)
-        print(f"Loading checkpoint from {args.ckpt} ...")
-        # if DataParallel, unwrap
-        m = model.module if isinstance(model, torch.nn.DataParallel) else model
-        m.load(args.ckpt)
-        print("Checkpoint loaded.")
-
-    # TRAINING
-    if args.mode in ("train", "train_eval"):
-        print("Starting training...")
-        trainer = Trainer(
-            model=model,
-            train_loader=train_loader,
-            val_loader=val_loader,
-            config=config
-        )
-        trainer.train()
-        print("Training finished.")
-
-    # EVALUATION
-    if args.mode in ("eval", "train_eval"):
-        # Ensure model is in eval mode
-        model.eval()
-        print("Starting evaluation...")
-        evaluator = Evaluator(
-            model=model,
-            test_loader=test_loader,
-            config=config
-        )
-        metrics = evaluator.evaluate()
-        bleu = metrics.get("bleu", None)
-        if bleu is not None:
-            print(f"Corpus BLEU = {bleu:.2f}")
-        else:
-            print("No BLEU score computed.", file=sys.stderr)
-        # Save metrics to file
-        metrics_path = os.path.join(output_dir, "metrics.txt")
-        with open(metrics_path, "w", encoding="utf-8") as f:
-            for k, v in metrics.items():
-                f.write(f"{k}: {v}\n")
-        print(f"Metrics saved to {metrics_path}")
-
-    print("All done.")
 
 
 if __name__ == "__main__":

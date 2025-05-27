@@ -1,115 +1,165 @@
-# config.py
+"""
+config.py
+
+Loads and validates configuration from a YAML or JSON file for the Transformer experiment.
+Exposes configuration as attributes: config.model, config.training, config.optimizer,
+config.lr_scheduler, config.evaluation, config.data, along with derived parameters.
+"""
 
 import os
 import json
-from typing import Any, Dict, Optional
+from typing import Any, Dict
+from types import SimpleNamespace
 
 import yaml
 
 
 class Config:
-    """Configuration loader and accessor for YAML/JSON config files.
+    """
+    Configuration loader and validator.
 
-    Provides a dot-separated key lookup interface to access nested config values.
+    Usage:
+        cfg = Config('config.yaml')
+        # Access parameters:
+        d_model = cfg.model.d_model
+        warmup = cfg.training.warmup_steps
+        lr_scale = cfg.lr_scale
     """
 
-    # Required top-level sections in the config file
-    _REQUIRED_SECTIONS = [
-        "training",
-        "model",
-        "optimizer",
-        "learning_rate_scheduler",
-        "data",
-        "inference",
-        "hardware",
-    ]
+    # Define the required schema: section -> {key: type}
+    _SCHEMA: Dict[str, Dict[str, type]] = {
+        "model": {
+            "encoder_layers": int,
+            "decoder_layers": int,
+            "d_model": int,
+            "d_ff": int,
+            "num_heads": int,
+            "dropout_rate": float,
+            "positional_encoding": str,
+            "share_embeddings": bool,
+        },
+        "training": {
+            "batch_tokens_src": int,
+            "batch_tokens_tgt": int,
+            "max_steps": int,
+            "warmup_steps": int,
+            "label_smoothing": float,
+        },
+        "optimizer": {
+            "type": str,
+            "beta1": float,
+            "beta2": float,
+            "eps": float,
+        },
+        "lr_scheduler": {
+            "type": str,
+        },
+        "evaluation": {
+            "beam_size": int,
+            "length_penalty": float,
+            "checkpoint_average": int,
+            "max_output_offset": int,
+        },
+        "data": {
+            "spm_vocab_size": int,
+        },
+    }
 
     def __init__(self, path: str) -> None:
-        """Initializes the Config object by loading and validating the config file.
+        """
+        Initialize Config by loading and validating the given YAML/JSON file.
 
-        Args:
-            path: Path to a YAML (.yaml/.yml) or JSON (.json) configuration file.
-
-        Raises:
-            FileNotFoundError: If the specified file does not exist.
-            ValueError: If the file extension is unsupported.
-            RuntimeError: If parsing the file fails.
-            KeyError: If required top-level sections are missing.
+        :param path: Path to YAML (.yaml/.yml) or JSON (.json) configuration file.
+        :raises FileNotFoundError: If the file does not exist.
+        :raises ValueError: If the file contents are invalid or missing required fields.
         """
         self._path = path
-        self._cfg_dict: Dict[str, Any] = {}
+        self._config_dict = self._load_file(path)
+        self._validate_and_populate(self._config_dict)
+        self._compute_derived()
 
-        if not os.path.isfile(self._path):
-            raise FileNotFoundError(f"Config file not found at '{self._path}'")
+    def _load_file(self, path: str) -> Dict[str, Any]:
+        """
+        Load a configuration file in YAML or JSON format.
 
-        ext = os.path.splitext(self._path)[1].lower()
+        :param path: File path.
+        :return: Parsed configuration as a dictionary.
+        :raises FileNotFoundError: If the file does not exist.
+        :raises ValueError: If parsing fails or root is not a dict.
+        """
+        if not os.path.isfile(path):
+            raise FileNotFoundError(f"Configuration file not found: {path}")
+        ext = os.path.splitext(path)[1].lower()
         try:
-            with open(self._path, "r", encoding="utf-8") as f:
-                if ext in (".yaml", ".yml"):
-                    self._cfg_dict = yaml.safe_load(f)
+            with open(path, "r", encoding="utf-8") as f:
+                if ext in [".yaml", ".yml"]:
+                    cfg = yaml.safe_load(f)
                 elif ext == ".json":
-                    self._cfg_dict = json.load(f)
+                    cfg = json.load(f)
                 else:
+                    # Try YAML by default
+                    cfg = yaml.safe_load(f)
+        except Exception as e:
+            raise ValueError(f"Failed to parse configuration file {path}: {e}")
+        if not isinstance(cfg, dict):
+            raise ValueError(f"Configuration root must be a mapping/object, got {type(cfg)}")
+        return cfg
+
+    def _validate_and_populate(self, cfg: Dict[str, Any]) -> None:
+        """
+        Validate the loaded config dict against the schema, and populate attributes.
+
+        :param cfg: Raw configuration dictionary.
+        :raises ValueError: If validation fails.
+        """
+        for section, fields in self._SCHEMA.items():
+            if section not in cfg:
+                raise ValueError(f"Missing required config section: '{section}'")
+            section_val = cfg[section]
+            if not isinstance(section_val, dict):
+                raise ValueError(f"Config section '{section}' must be a mapping, got {type(section_val)}")
+            # Validate each field
+            for key, expected_type in fields.items():
+                if key not in section_val:
+                    raise ValueError(f"Missing required config field: '{section}.{key}'")
+                val = section_val[key]
+                # Allow int where float is expected
+                if expected_type is float and isinstance(val, int):
+                    val = float(val)
+                    section_val[key] = val
+                if not isinstance(val, expected_type):
                     raise ValueError(
-                        f"Unsupported config file type '{ext}'. "
-                        "Expected '.yaml', '.yml', or '.json'."
+                        f"Config field '{section}.{key}' must be of type {expected_type.__name__}, "
+                        f"got {type(val).__name__}"
                     )
-        except (yaml.YAMLError, json.JSONDecodeError) as e:
-            raise RuntimeError(f"Error parsing config file '{self._path}': {e}") from e
+            # Populate as SimpleNamespace for attribute access
+            setattr(self, section, SimpleNamespace(**section_val))
 
-        if not isinstance(self._cfg_dict, dict):
-            raise RuntimeError(
-                f"Config file '{self._path}' did not produce a dict; got {type(self._cfg_dict)}"
-            )
-
-        self._validate_required_sections()
-
-    def _validate_required_sections(self) -> None:
-        """Validates that all required top-level sections are present in the config.
-
-        Raises:
-            KeyError: If any required section is missing.
+    def _compute_derived(self) -> None:
         """
-        missing = [
-            section
-            for section in self._REQUIRED_SECTIONS
-            if section not in self._cfg_dict
-        ]
-        if missing:
-            raise KeyError(
-                f"Missing required config section(s): {', '.join(missing)}"
-            )
-
-    def get(self, key: str, default: Optional[Any] = None) -> Any:
-        """Retrieves a configuration value using dot-separated keys.
-
-        Args:
-            key: Dot-separated key string, e.g., "training.total_steps".
-            default: Value to return if the key is not found.
-
-        Returns:
-            The config value if found; otherwise, returns `default`.
+        Compute derived configuration values for convenience.
         """
-        parts = key.split(".")
-        node: Any = self._cfg_dict
+        # Inverse square-root of d_model for learning rate scaling
+        d_model = self.model.d_model
+        self.lr_scale: float = d_model ** -0.5
+        # Total token count per batch (src + tgt)
+        self.total_batch_tokens: int = self.training.batch_tokens_src + self.training.batch_tokens_tgt
 
-        for part in parts:
-            if not isinstance(node, dict):
-                return default
-            if part in node:
-                node = node[part]
-            else:
-                return default
-
-        return node
-
-    def all(self) -> Dict[str, Any]:
-        """Returns the entire configuration dictionary.
-
-        Returns:
-            A dict representation of the loaded config.
+    def dump(self) -> None:
         """
-        return self._cfg_dict
+        Print the loaded configuration in a friendly YAML format.
+        """
+        try:
+            dump_dict = self._config_dict.copy()
+            # Insert derived values
+            dump_dict["derived"] = {
+                "lr_scale": self.lr_scale,
+                "total_batch_tokens": self.total_batch_tokens,
+            }
+            print(yaml.dump(dump_dict, default_flow_style=False, sort_keys=False))
+        except Exception:
+            # Fallback to simple repr
+            print(self._config_dict)
 
     def __repr__(self) -> str:
-        return f"<Config path='{self._path}' sections={list(self._cfg_dict.keys())}>"
+        return f"<Config path={self._path!r}>"

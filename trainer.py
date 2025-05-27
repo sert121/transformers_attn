@@ -1,236 +1,169 @@
-## trainer.py
+"""
+trainer.py
+
+Implements the Trainer class to orchestrate training of the Transformer model
+with label smoothing, inverse-sqrt learning rate schedule with warmup, and
+checkpointing as per 'Attention Is All You Need'.
+"""
 
 import os
-import math
-from typing import Dict, Any
+from typing import Dict
 
 import torch
 import torch.nn.functional as F
-from torch.utils.data import DataLoader
-from tqdm import tqdm
+from torch.optim import Optimizer
+from torch.optim.lr_scheduler import LambdaLR
 
-from utils import Config, get_lr_scheduler, label_smoothing
+from config import Config
+from dataset_loader import DatasetLoader
+from utils import Utils
 from model import TransformerModel
 
 
 class Trainer:
     """
-    Trainer class to handle training and validation loops for the Transformer model.
+    Trainer for the Transformer model.
+
+    Responsibilities:
+      - Run training loop for a fixed number of steps
+      - Apply label smoothing and compute loss over non-padding tokens
+      - Use Adam optimizer with inverse sqrt learning-rate schedule
+      - Save checkpoints evenly spaced for later averaging
     """
 
     def __init__(
         self,
         model: TransformerModel,
-        train_loader: DataLoader,
-        val_loader: DataLoader,
+        optimizer: Optimizer,
+        loader: DatasetLoader,
         config: Config
     ) -> None:
         """
         Initialize the Trainer.
 
         Args:
-            model: The Transformer model to train.
-            train_loader: DataLoader for training data.
-            val_loader: DataLoader for validation data.
-            config: Configuration object.
+            model (TransformerModel): The model to train.
+            optimizer (Optimizer): The optimizer (Adam).
+            loader (DatasetLoader): Data loader for train/dev splits.
+            config (Config): Configuration object.
         """
-        # Model and data
         self.model = model
-        self.train_loader = train_loader
-        self.val_loader = val_loader
+        self.optimizer = optimizer
+        self.loader = loader
         self.config = config
 
-        # Device setup
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.model.to(self.device)
+        # Device inferred from model parameters
+        self.device = next(model.parameters()).device
 
-        # Optimizer setup
-        optim_cfg = config.get("optimizer")
-        opt_type = optim_cfg.get("type", "Adam").lower()
-        beta1 = float(optim_cfg.get("beta1", 0.9))
-        beta2 = float(optim_cfg.get("beta2", 0.98))
-        eps = float(optim_cfg.get("epsilon", 1e-9))
-        if opt_type != "adam":
-            raise ValueError(f"Unsupported optimizer type: {opt_type}")
-        self.optimizer = torch.optim.Adam(
-            self.model.parameters(),
-            betas=(beta1, beta2),
-            eps=eps
-        )
+        # Learning rate scheduler: inverse sqrt with warmup
+        warmup_steps = self.config.training.warmup_steps
+        # config.lr_scale = d_model^{-0.5}
+        def lr_lambda(step: int) -> float:
+            # step starts from 0 in LambdaLR; shift to 1-based
+            curr_step = step + 1
+            return self.config.lr_scale * min(
+                curr_step ** -0.5,
+                curr_step * (warmup_steps ** -1.5)
+            )
 
-        # Learning rate scheduler
-        lr_cfg = config.get("lr_scheduler")
-        d_model = int(lr_cfg.get("d_model", config.get("model.d_model", 512)))
-        warmup_steps = int(lr_cfg.get("warmup_steps", config.get("training.warmup_steps", 4000)))
-        self.scheduler = get_lr_scheduler(self.optimizer, d_model, warmup_steps)
+        self.scheduler = LambdaLR(self.optimizer, lr_lambda=lr_lambda)
 
-        # Label smoothing
-        self.label_smoothing_eps = float(config.get("training.label_smoothing", 0.0))
+        # Checkpointing: split max_steps into `checkpoint_average` intervals
+        avg_ckpts = self.config.evaluation.checkpoint_average
+        max_steps = self.config.training.max_steps
+        # Ensure at least one step interval
+        self.ckpt_interval = max(1, max_steps // avg_ckpts)
 
-        # Padding token id (assumed 0 unless overridden)
-        self.pad_idx = int(config.get("data.pad_id", 0))
+        # Padding token ID needed for masking loss
+        self.pad_id = loader.pad_id
 
-        # Training parameters
-        self.max_steps = int(config.get("training.max_steps", 100000))
-        # how often (in steps) to run validation
-        self.eval_interval = int(config.get("training.eval_interval", 5000))
-
-        # Checkpointing
-        self.ckpt_dir = config.get("training.ckpt_dir", "checkpoints")
+        # Checkpoint directory (default './checkpoints' if not in config)
+        ckpt_dir = getattr(self.config.training, 'checkpoint_dir', 'checkpoints')
+        self.ckpt_dir = ckpt_dir
         os.makedirs(self.ckpt_dir, exist_ok=True)
-        self.best_ppl = float("inf")
 
-        # Internal step counter
-        self.step = 0
 
     def train(self) -> None:
         """
-        Run the full training loop, including periodic validation
-        and checkpointing.
+        Run the training loop for `config.training.max_steps` steps.
         """
         self.model.train()
-        progress_bar = tqdm(total=self.max_steps, desc="Training", unit="step")
-        # Loop until we reach max_steps
-        while self.step < self.max_steps:
-            for batch in self.train_loader:
-                if self.step >= self.max_steps:
-                    break
-                self.step += 1
-                loss = self._train_step(batch)
-                lr = self.scheduler.get_last_lr()[0]
-                progress_bar.set_postfix(
-                    loss=f"{loss:.4f}",
-                    lr=f"{lr:.6f}"
-                )
-                progress_bar.update(1)
+        train_loader = self.loader.load_data('train')
 
-                # Validation & checkpointing
-                if (self.step % self.eval_interval == 0) or (self.step == self.max_steps):
-                    val_metrics = self._validate()
-                    val_ppl = val_metrics["ppl"]
-                    is_best = val_ppl < self.best_ppl
-                    if is_best:
-                        self.best_ppl = val_ppl
-                        ckpt_path = os.path.join(
-                            self.ckpt_dir,
-                            f"ckpt_step{self.step}_ppl{val_ppl:.2f}.pt"
-                        )
-                        self.model.save(ckpt_path)
-                    print(
-                        f"\n[Step {self.step}] Validation Perplexity: {val_ppl:.4f} "
-                        f"(best: {self.best_ppl:.4f}) "
-                        f"{'[Saved]' if is_best else ''}\n"
-                    )
-            # end for batch
-        # end while
-        progress_bar.close()
+        max_steps = self.config.training.max_steps
+        label_smoothing = self.config.training.label_smoothing
+        vocab_size = self.config.data.spm_vocab_size
+
+        step = 0
+        for batch in train_loader:
+            step += 1
+            if step > max_steps:
+                break
+
+            # Move inputs to device
+            src = batch['src'].to(self.device)                # (B, src_len)
+            tgt_input = batch['tgt_input'].to(self.device)    # (B, tgt_len)
+            tgt_output = batch['tgt_output'].to(self.device)  # (B, tgt_len)
+
+            # Forward pass (model builds its own masks internally)
+            logits = self.model(src, tgt_input)               # (B, tgt_len, V)
+
+            # Compute label-smoothed loss
+            B, T, V = logits.size()
+            log_probs = F.log_softmax(logits, dim=-1)         # (B, T, V)
+            log_probs = log_probs.view(-1, V)                # (B*T, V)
+            target = tgt_output.contiguous().view(-1)        # (B*T,)
+
+            # Build smoothed target distributions
+            with torch.no_grad():
+                true_dist = torch.zeros_like(log_probs)
+                true_dist.scatter_(1, target.unsqueeze(1), 1.0)
+                true_dist = true_dist * (1.0 - label_smoothing) + (label_smoothing / V)
+
+            # Negative log-likelihood per token
+            nll = - (true_dist * log_probs).sum(dim=1)       # (B*T,)
+
+            # Mask out padding tokens in loss
+            pad_mask = (target != self.pad_id)
+            nll = nll[pad_mask]                              # Only non-pad tokens
+            n_tokens = pad_mask.sum().item()
+            loss = nll.sum() / max(1, n_tokens)
+
+            # Backward and optimization step
+            self.optimizer.zero_grad()
+            loss.backward()
+            self.optimizer.step()
+            self.scheduler.step()
+
+            # Checkpointing
+            if step % self.ckpt_interval == 0:
+                self.save_checkpoint(step)
+
+            # Logging every 100 steps and first step
+            if step == 1 or step % 100 == 0:
+                curr_lr = self.optimizer.param_groups[0]['lr']
+                print(f"[Step {step}/{max_steps}] Loss: {loss.item():.4f}, LR: {curr_lr:.6e}")
+
+        # Final checkpoint if not aligned with interval
+        if step % self.ckpt_interval != 0:
+            self.save_checkpoint(step)
         print("Training complete.")
 
-    def _train_step(self, batch: Dict[str, torch.Tensor]) -> float:
+
+    def save_checkpoint(self, step: int) -> None:
         """
-        Perform a single training step (forward, loss, backward, update).
+        Save a checkpoint at the given step, including model, optimizer,
+        scheduler states and current step number.
 
         Args:
-            batch: A dict containing 'src' and 'tgt' tensors.
-
-        Returns:
-            The scalar loss value for this step.
+            step (int): The training step number.
         """
-        # Unpack and move to device
-        src = batch["src"].to(self.device)   # (B, S)
-        tgt = batch["tgt"].to(self.device)   # (B, T)
-
-        # Prepare target input and output
-        # e.g., input: [<s>, ... , x_{T-1}], output: [..., x_T, </s>]
-        tgt_input = tgt[:, :-1]
-        tgt_output = tgt[:, 1:]
-
-        # Forward pass
-        logits = self.model(src, tgt_input)  # (B, T-1, V)
-        B, Tm1, V = logits.size()
-
-        # Flatten for loss
-        logits_flat = logits.contiguous().view(-1, V)       # (B*(T-1), V)
-        labels_flat = tgt_output.contiguous().view(-1)      # (B*(T-1),)
-
-        # Compute mask and token count
-        non_pad_mask = labels_flat.ne(self.pad_idx)
-        n_tokens = non_pad_mask.sum().item()
-        if n_tokens == 0:
-            # nothing to learn on this batch
-            return 0.0
-
-        # Loss computation
-        if self.label_smoothing_eps > 0.0:
-            # KL divergence with smoothed targets
-            # build one-hot
-            with torch.no_grad():
-                one_hot = torch.zeros_like(logits_flat).scatter_(
-                    1, labels_flat.unsqueeze(1), 1.0
-                )
-                smooth = label_smoothing(one_hot, self.label_smoothing_eps)
-            log_probs = F.log_softmax(logits_flat, dim=-1)
-            loss = F.kl_div(log_probs, smooth, reduction="sum")
-        else:
-            # Standard cross-entropy
-            loss = F.cross_entropy(
-                logits_flat,
-                labels_flat,
-                ignore_index=self.pad_idx,
-                reduction="sum"
-            )
-        # Normalize by number of non-pad tokens
-        loss = loss / n_tokens
-
-        # Backprop & update
-        self.optimizer.zero_grad()
-        loss.backward()
-        # Optionally: gradient clipping here if needed
-        self.optimizer.step()
-        self.scheduler.step()
-
-        return loss.item()
-
-    def _validate(self) -> Dict[str, float]:
-        """
-        Evaluate the model on the validation set to compute perplexity.
-
-        Returns:
-            A dict with key 'ppl' and the computed perplexity.
-        """
-        self.model.eval()
-        total_loss = 0.0
-        total_tokens = 0
-
-        with torch.no_grad():
-            for batch in self.val_loader:
-                src = batch["src"].to(self.device)
-                tgt = batch["tgt"].to(self.device)
-                tgt_input = tgt[:, :-1]
-                tgt_output = tgt[:, 1:]
-
-                logits = self.model(src, tgt_input)  # (B, T-1, V)
-                B, Tm1, V = logits.size()
-                logits_flat = logits.contiguous().view(-1, V)
-                labels_flat = tgt_output.contiguous().view(-1)
-
-                # sum-cross-entropy
-                loss_sum = F.cross_entropy(
-                    logits_flat,
-                    labels_flat,
-                    ignore_index=self.pad_idx,
-                    reduction="sum"
-                ).item()
-
-                # count valid tokens
-                n_tokens = labels_flat.ne(self.pad_idx).sum().item()
-                total_loss += loss_sum
-                total_tokens += n_tokens
-
-        # restore train mode
-        self.model.train()
-
-        # compute perplexity
-        avg_loss = total_loss / max(1, total_tokens)
-        ppl = math.exp(avg_loss)
-        return {"ppl": ppl}
+        ckpt_path = os.path.join(self.ckpt_dir, f"checkpoint_{step}.pt")
+        state: Dict[str, object] = {
+            'step': step,
+            'model_state': self.model.state_dict(),
+            'optimizer_state': self.optimizer.state_dict(),
+            'scheduler_state': self.scheduler.state_dict()
+        }
+        torch.save(state, ckpt_path)
+        print(f"Saved checkpoint: {ckpt_path}")

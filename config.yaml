@@ -1,42 +1,46 @@
 ## config.yaml
 
-data:
-  train_src: data/wmt14_en_de/train.en
-  train_tgt: data/wmt14_en_de/train.de
-  val_src: data/wmt14_en_de/valid.en
-  val_tgt: data/wmt14_en_de/valid.de
-  test_src: data/wmt14_en_de/test.en
-  test_tgt: data/wmt14_en_de/test.de
-  vocab_type: bpe
-  vocab_size: 37000
-  max_tokens_per_batch: 25000
-
 model:
-  num_layers: 6
+  # Base Transformer configuration
+  encoder_layers: 6
+  decoder_layers: 6
   d_model: 512
   d_ff: 2048
   num_heads: 8
   dropout_rate: 0.1
-  share_embeddings: true
   positional_encoding: sinusoidal
+  share_embeddings: true
 
 training:
+  # Token-based batch sizing (approx. per step)
+  batch_tokens_src: 25000
+  batch_tokens_tgt: 25000
+
+  # Total training steps
   max_steps: 100000
+
+  # Learning rate warmup
   warmup_steps: 4000
+
+  # Label smoothing
   label_smoothing: 0.1
 
 optimizer:
-  type: Adam
+  type: adam
   beta1: 0.9
   beta2: 0.98
-  epsilon: 1e-9
+  eps: 1e-9
 
 lr_scheduler:
-  type: noam
-  d_model: 512
-  warmup_steps: 4000
+  type: inverse_sqrt
+  # lr = d_model^(-0.5) * min(step^(-0.5), step * warmup_steps^(-1.5))
 
-decoding:
+evaluation:
   beam_size: 4
   length_penalty: 0.6
-  max_output_length_offset: 50
+  checkpoint_average: 5
+  max_output_offset: 50
+
+data:
+  # Shared source‐target vocabulary size for En–De
+  spm_vocab_size: 37000
