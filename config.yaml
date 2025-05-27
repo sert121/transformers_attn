@@ -1,0 +1,55 @@
+## config.yaml
+
+training:
+  # Total training steps for base Transformer
+  train_steps: 100000
+  # Batch size in tokens (approximate per device)
+  batch_source_tokens: 25000
+  batch_target_tokens: 25000
+  # Beam search settings for inference
+  beam_size: 4
+  length_penalty: 0.6
+
+optimizer:
+  type: adam
+  beta1: 0.9
+  beta2: 0.98
+  epsilon: 1e-9
+
+scheduler:
+  # Transformer-style warmup + inverse-sqrt decay
+  type: transformer
+  d_model: 512
+  warmup_steps: 4000
+
+model:
+  # Encoder and decoder layer counts
+  encoder_layers: 6
+  decoder_layers: 6
+  # Hidden dimensions
+  d_model: 512
+  d_ff: 2048
+  # Multi-head attention
+  n_heads: 8
+  d_k: 64
+  d_v: 64
+  # Dropout probability
+  dropout_rate: 0.1
+
+regularization:
+  # Label smoothing on target distribution
+  label_smoothing: 0.1
+
+data:
+  # WMT14 En→De settings
+  task: wmt14_en_de
+  tokenizer: byte_pair_encoding
+  shared_vocab: true
+  vocab_size: 37000
+  bpe_merges: 37000
+
+evaluation:
+  # At inference: max output length = input_length + max_offset
+  max_length_offset: 50
+  metrics:
+    - bleu
