@@ -1,66 +1,43 @@
 ## config.yaml
 
-# Data paths and preprocessing
-data:
-  train_src: "data/wmt14_en_de/train.en"
-  train_tgt: "data/wmt14_en_de/train.de"
-  dev_src:   "data/wmt14_en_de/newstest2013.en"
-  dev_tgt:   "data/wmt14_en_de/newstest2013.de"
-  test_src:  "data/wmt14_en_de/newstest2014.en"
-  test_tgt:  "data/wmt14_en_de/newstest2014.de"
-  max_seq_length: 100
-
-# Subword vocabulary settings
-tokenizer:
-  type: "byte-pair"
-  vocab_size: 37000
-  merges: 37000
-  special_tokens:
-    - "<pad>"
-    - "<s>"
-    - "</s>"
-    - "<unk>"
-
-# Model architecture hyperparameters
-model:
-  name: "transformer"
-  d_model: 512
-  d_ff: 2048
-  num_layers: 6
-  num_heads: 8
-  dropout: 0.1
-  max_position_embeddings: 512
-
-# Training configuration
 training:
-  max_steps: 100000
-  batch_tokens: 25000        # approximate tokens per batch (source & target)
-  eval_steps: 10000          # dev evaluation interval
-  save_steps: 10000          # checkpoint interval
-  seed: 42
+  total_steps: 100000            # Number of training steps for base model
+  warmup_steps: 4000             # Learning rate warmup
+  label_smoothing: 0.1           # Label smoothing factor
+  batch:
+    max_source_tokens: 25000     # Approx. source tokens per batch
+    max_target_tokens: 25000     # Approx. target tokens per batch
 
-# Optimizer settings
+model:
+  encoder_layers: 6              # Number of encoder blocks
+  decoder_layers: 6              # Number of decoder blocks
+  d_model: 512                   # Embedding & model hidden size
+  d_ff: 2048                     # Feed-forward inner layer size
+  num_heads: 8                   # Multi-head attention heads
+  dropout_rate: 0.1              # Dropout probability
+  share_embedding_and_softmax: true  # Tie input embeddings and pre-softmax weights
+
 optimizer:
-  type: "Adam"
+  type: Adam
   betas: [0.9, 0.98]
-  epsilon: 1e-9
+  eps: 1e-9
 
-# Learning rate scheduler
-scheduler:
-  type: "warmup_inverse_sqrt"
+learning_rate_scheduler:
+  type: Noam
+  formula: "lr = d_model^{-0.5} * min(step^{-0.5}, step * warmup_steps^{-1.5})"
   warmup_steps: 4000
 
-# Regularization
-regularization:
-  label_smoothing: 0.1
+data:
+  language_pair: en-de
+  train_dataset: WMT2014
+  vocab:
+    type: byte-pair
+    size: 37000
 
-# Inference / Decoding
 inference:
   beam_size: 4
-  length_penalty: 0.6
+  length_penalty_alpha: 0.6
   max_length_offset: 50
 
-# Logging and checkpoints
-logging:
-  log_dir: "logs/"
-  checkpoint_dir: "checkpoints/"
+hardware:
+  gpus: 8
